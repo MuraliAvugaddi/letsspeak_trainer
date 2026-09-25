@@ -1,0 +1,298 @@
+name: letsspeak_trainer
+description: "A new Flutter project."
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.10.1
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  cupertino_icons: ^1.0.8
+  get: ^4.7.3
+  http: ^1.6.0
+  google_fonts: ^8.2.1
+  get_storage: ^2.1.1
+  google_nav_bar: ^5.0.7
+  line_icons: ^2.0.3
+  url_launcher: ^6.3.2
+  connectivity_plus: ^7.3.1
+  youtube_player_flutter: ^9.1.3
+  intl: 0.20.2
+  preload_page_view: ^0.2.0
+  geolocator: ^14.0.3
+  flutter_launcher_icons: ^0.13.1
+  firebase_core: ^4.13.0
+  firebase_auth: ^6.5.7
+  firebase_messaging: ^16.5.0
+  pinput: ^6.0.2
+  socket_io_client: ^3.1.6
+  flutter_pdfview: ^1.4.5
+  path_provider: ^2.1.6
+  in_app_update: ^4.2.2
+  stream_video_flutter: ^1.5.0
+  wakelock_plus: ^1.2.8
+  firebase_core_web: 3.10.0
+  internet_connection_checker_plus: ^3.1.2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true
+
+  # PDF Materials Assets Paths
+  assets:
+    # - Stage 1 material
+    - assets/images/satge1/Day-2_English_ST-1_(Past Be).pdf
+    - assets/images/satge1/Day-3_English_ST-1 (Past Be).pdf
+    - assets/images/satge1/Day-4_English_ST-1 (Pre Be).pdf
+    - assets/images/satge1/Day-5_English_ST-1 (Future Be).pdf
+    - assets/images/satge1/Day-6_ST-1_Eng (Articles & Practice On Be).pdf
+    - assets/images/satge1/Day-7_ST-1_Eng (There Form).pdf
+    - assets/images/satge1/Day-8_ST-1_Eng (Past Have).pdf
+    - assets/images/satge1/Day-9_ST-1_Eng (Present Have).pdf
+    - assets/images/satge1/Day-10_ST-1_Eng (Future Have).pdf
+    - assets/images/satge1/Day-11_ST-1_Eng (🔴Practice On Be, There & Have).pdf
+    - assets/images/satge1/Day-12_ST-1_Eng (Formation Of Action Verbs).pdf
+    - assets/images/satge1/Day-13_ST-1_Eng (Past Simple A.V).pdf
+    - assets/images/satge1/Day-14_ST-1_Eng (Present Simple A.V).pdf
+    - assets/images/satge1/Day-15_ST-1_Eng (Future Simple A.V).pdf
+    - assets/images/satge1/Day-16_ST-1_Eng (🔴Practice On Simple A.v).pdf
+    - assets/images/satge1/Day-17_ST-1_Eng (Past Simple Passive Voice).pdf
+    - assets/images/satge1/Day-18_ST-1_Eng (Present Simple P.V).pdf
+    - assets/images/satge1/Day-19_ST-1_Eng (Future Simple P.V).pdf
+    - assets/images/satge1/Day-21_ST-1_Eng (Past Continuous A.V & P.V).pdf
+    - assets/images/satge1/Day-22_ST-1_Eng (Present Continuous A.V & P.V).pdf
+    - assets/images/satge1/Day-23_ST-1_Eng (Future Continuous A.v).pdf
+    - assets/images/satge1/Day-24_ST-1_Eng (🔴Practice on Simple & Continuous A.v & P.v).pdf
+    - assets/images/satge1/Day-25_ST-1_Eng (Past Simple Make, Let & Get-Causative verbs).pdf
+    - assets/images/satge1/Day-26_ST-1_Eng (Present Simple M.L.G).pdf
+    - assets/images/satge1/Day-27_ST-1_Eng (Future Simple M.L.G).pdf
+    - assets/images/satge1/Day-28_ST-1_Eng (Past & Present Continuous M.L.G).pdf
+
+    # - Stage 2 material
+    - assets/images/satge2/Day-2_ST-2_Eng (Order-1&2).pdf
+    - assets/images/satge2/Day-3_ST-2_Eng (Request-1&2).pdf
+    - assets/images/satge2/Day-4_ST-2_Eng (Permission 1&2).pdf
+    - assets/images/satge2/Day-5_ST-2_Eng (Suggestion 1&2).pdf
+    - assets/images/satge2/Day-6_ST-2_Eng (🔴Practice on Imperative sentences).pdf
+    - assets/images/satge2/Day-7_ST-2_Eng (Past habit-1).pdf
+    - assets/images/satge2/Day-8_ST-2_Eng (Past habit-2,3 & 4).pdf
+    - assets/images/satge2/Day-9_ST-2_Eng (Present habit-2,3 & 4).pdf
+    - assets/images/satge2/Day-10_ST-2_Eng (Future habit-2 & 4).pdf
+    - assets/images/satge2/Day-11_ST-2_Eng (Past permanent ability comparison with past simple).pdf
+    - assets/images/satge2/Day-12_ST-2_Eng (Past temporary ability comparison with past continuous).pdf
+    - assets/images/satge2/Day-13_ST-2_Eng (Present permanent ability comparison with present simple).pdf
+    - assets/images/satge2/Day-14_ST-2_Eng (Present temporary ability comparison with Present continuous).pdf
+    - assets/images/satge2/Day-15_ST-2_Eng (Future permanent & temporary ability comparison with future simple & continuous).pdf
+    - assets/images/satge2/Day-16_ST-2_Eng (🔴 Practice on Ability, Simple & Continuous).pdf
+    - assets/images/satge2/Day-17_ST-2_Eng (Past willingness-1).pdf
+    - assets/images/satge2/Day-18_ST-2_Eng (Past willingness-2).pdf
+    - assets/images/satge2/Day-19_ST-2_Eng (Present willingness-1).pdf
+    - assets/images/satge2/Day-20_ST-2_Eng (Present willingness-2).pdf
+    - assets/images/satge2/Day-21_ST-2_Eng (🔴Practice on Past & Present willingness-1&2).pdf
+    - assets/images/satge2/Day-22_ST-2_Eng (Past, Present & Future willingness-3).pdf
+    - assets/images/satge2/Day-23_ST-2_Eng (Past, Present & Future compulsion).pdf
+    - assets/images/satge2/Day-24_ST-2_Eng (Lower modals).pdf
+    - assets/images/satge2/Day-25_ST-2_Eng (Integration of lower modals).pdf
+    - assets/images/satge2/Day-26_ST-2_Eng (Integration of would [used to]).pdf
+    - assets/images/satge2/Day-27_ST-2_Eng (Gerund).pdf
+    - assets/images/satge2/Day-28_ST-2_Eng (It function).pdf
+
+    # - Stage 3 material
+    - assets/images/satge3/Day-2_ST-3_Eng (The Conjunctions of If & Unless).pdf
+    - assets/images/satge3/Day-3_ST-3_Eng (The conjunctions of When,Only When & While).pdf
+    - assets/images/satge3/Day-4_ST-3_Eng (🔴 Practice on If, Unless, When, Only When & While).pdf
+    - assets/images/satge3/Day-5_ST-3_Eng (The conjunctions of Before & After).pdf
+    - assets/images/satge3/Day-6_ST-3_Eng (The conjunctions of As soon as, As long as & Till [Until]).pdf
+    - assets/images/satge3/Day-7_ST-3_Eng (🔴 Practice on Time conjunctions).pdf
+    - assets/images/satge3/Day-8_ST-3_Eng (The conjunctions of reasons But, So, Since_As, That's why_Hence, because, Although_Though_Even though, Yet,...... (1).pdf
+    - assets/images/satge3/Day-9_ST-3_Eng (🔴 Practice on conjunctions of reasons).pdf
+    - assets/images/satge3/Day-10_ST-3_Eng (Conjunctions of ever family [Whatever, Whomever, Whoever, Whenever & Wherever]).pdf
+    - assets/images/satge3/Day-11_ST-3_Eng (🔴Practice on all the conjunctions).pdf
+    - assets/images/satge3/Day-12_ST-3_Eng (Present perfect BE FORM).pdf
+    - assets/images/satge3/Day-13_ST-3_Eng (Present Perfect THERE FORM).pdf
+    - assets/images/satge3/Day-14_ST-3_Eng (Present Perfect IT FORM).pdf
+    - assets/images/satge3/Day-15_ST-3_Eng (Present Perfect HAVE FORM).pdf
+    - assets/images/satge3/Day-16_ST-3_Eng (🔴 Practice on Present Perfect BE, THERE, IT & HAVE forms).pdf
+    - assets/images/satge3/Day-17_ST-3_Eng (Present Perfect A.V).pdf
+    - assets/images/satge3/Day-18_ST-3_Eng (Present Perfect P.V).pdf
+    - assets/images/satge3/Day-19_ST-3_Eng (Present Perfect Continuous A.V).pdf
+    - assets/images/satge3/Day-20_ST-3_Eng (🔴 Practice on Present Perfect & Simple tenses).pdf
+    - assets/images/satge3/Day-21_ST-3_Eng (Past Perfect BE FORM).pdf
+    - assets/images/satge3/Day-22_ST-3_Eng (Past Perfect HAVE FORM).pdf
+    - assets/images/satge3/Day-23_ST-3_Eng (Past Perfect ACTIVE VOICE).pdf
+    - assets/images/satge3/Day-24_ST-3_Eng (Past Perfect PASSIVE VOICE).pdf
+    - assets/images/satge3/Day-25_ST-3_Eng (Past Perfect Continuous A.V).pdf
+    - assets/images/satge3/Day-26_ST-3_Eng (🔴Practice on the whole Past Perfect tense).pdf
+    - assets/images/satge3/Day-27_ST-3_Eng (Future Perfect BE & HAVE form).pdf
+    - assets/images/satge3/Day-28_ST-3_Eng (Future Perfect A.V & P.V).pdf
+
+    # - Stage 4 material
+    - assets/images/stage4/Day-2_ST-4_Eng (Higher modal-1).pdf
+    - assets/images/stage4/Day-3_ST-4_Eng (Higher modal-2).pdf
+    - assets/images/stage4/Day-4_ST-4_Eng (Higher modal-3,4 & 5).pdf
+    - assets/images/stage4/Day-5_ST-4_Eng (Integration of higher modals).pdf
+    - assets/images/stage4/Day-6_ST-4_Eng (🔴 Practice on Integration of higher modals).pdf
+    - assets/images/stage4/Day-7_ST-4_Eng (0-Condition).pdf
+    - assets/images/stage4/Day-8_ST-4_Eng (Real-Condition).pdf
+    - assets/images/stage4/Day-9_ST-4_Eng (Unfulfilled- Condition).pdf
+    - assets/images/stage4/Day-10_ST-4_Eng (Imaginary- Condition).pdf
+    - assets/images/stage4/Day-11_ST-4_Eng (🔴 Practice on conditional clauses).pdf
+    - assets/images/stage4/Day-12_ST-4_Eng (Adjectives followed by prepositions).pdf
+    - assets/images/stage4/Day-13_ST-4_Eng (Verbs followed by prepositions).pdf
+    - assets/images/stage4/Day-14_ST-4_Eng (Phrasal verbs).pdf
+    - assets/images/stage4/Day-15_ST-4_Eng (Phrasal Prepositions).pdf
+    - assets/images/stage4/Day-16_ST-4_Eng (Exclamatory sentences).pdf
+    - assets/images/stage4/Day-17_ST-4_Eng (WH +Statement of simple & perfect tenses).pdf
+    - assets/images/stage4/Day-18_ST-4_Eng (Question tags of simple & perfect tenses).pdf
+    - assets/images/stage4/Day-19_ST-4_Eng (Also, Too & Either of simple & perfect tenses).pdf
+    - assets/images/stage4/Day-20_ST-4_Eng (So, do I & neither do I of simple & perfect tenses).pdf
+    - assets/images/stage4/Day-21_ST-4_Eng (Reflexive pronouns of simple & perfect tenses).pdf
+    - assets/images/stage4/Day-22_ST-4_Eng (Possessive pronouns of simple & perfect tenses).pdf
+    - assets/images/stage4/Day-23_ST-4_Eng (Always, never & ever of simple & perfect tenses).pdf
+    - assets/images/stage4/Day-24_ST-4_Eng (Quantifiers of simple & perfect tenses).pdf
+    - assets/images/stage4/Day-25_ST-4_Eng (Degrees of Comparison[Positive & Comparative]).pdf
+
+    # - Hindi material
+    # - Hindi Stage 1
+    - assets/images/Hindi/stagehindiStage1/Day-2_Foundation_Hin (+Sta Past BE FORM).pdf
+    - assets/images/Hindi/stagehindiStage1/Day-3_Foundation_Hin (- Sta Past BE FORM).pdf
+    - assets/images/Hindi/stagehindiStage1/Day-4_Foundation_Hin (+_- Y_N Past BE FORM).pdf
+    - assets/images/Hindi/stagehindiStage1/Day-5_Foundation_Hin (+_- W.H Past BE FORM).pdf
+    - assets/images/Hindi/stagehindiStage1/Day-6_Foundation_Hin (+Sta Present BE FORM).pdf
+    - assets/images/Hindi/stagehindiStage1/Day-7_Foundation_Hin (-Sta Present BE FORM).pdf
+    - assets/images/Hindi/stagehindiStage1/Day-8_Foundation_Hin (+Y_N Que Present BE FORM).pdf
+    - assets/images/Hindi/stagehindiStage1/Day-9_Foundation_Hin (-Y_N Que Present BE FORM).pdf
+    - assets/images/Hindi/stagehindiStage1/Day-10_Foundation_Hin (+W.H Que Present BE FORM).pdf
+    - assets/images/Hindi/stagehindiStage1/Day-11_Foundation_Hin (-W.H Que Present BE FORM).pdf
+    - assets/images/Hindi/stagehindiStage1/Day-12_Foundation_Hin (+Sta Future BE FORM).pdf
+    - assets/images/Hindi/stagehindiStage1/Day-13_Foundation_Hin (-Sta Future BE FORM).pdf
+    - assets/images/Hindi/stagehindiStage1/Day-14_Foundation_Hin (+ Y_N Que Future BE FORM).pdf
+    - assets/images/Hindi/stagehindiStage1/Day-15_Foundation_Hin (- Y_N Que Future BE FORM).pdf
+    - assets/images/Hindi/stagehindiStage1/Day-16_Foundation_Hin (+ W.H Que Future BE FORM).pdf
+    - assets/images/Hindi/stagehindiStage1/Day-17_Foundation_Hin (- W.H Que Future BE FORM).pdf
+    - assets/images/Hindi/stagehindiStage1/Day-18_Foundation_Hin (+_- Sta There & Here).pdf
+    - assets/images/Hindi/stagehindiStage1/Day-19_Foundation_Hin (+_- Y_N Que There & Here).pdf
+    - assets/images/Hindi/stagehindiStage1/Day-20_Foundation_Hin (+_- W.H Que There & Here).pdf
+    
+    # - Hindi Stage 2
+    - assets/images/Hindi/stagehindistage2/Day-2_Accuracy_Hin (+ Sta Past Have).pdf
+    - assets/images/Hindi/stagehindistage2/Day-3_Accuracy_Hin (- Sta Past Have).pdf
+    - assets/images/Hindi/stagehindistage2/Day-4_Accuracy_Hin (+ Y_N Past Have).pdf
+    - assets/images/Hindi/stagehindistage2/Day-5_Accuracy_Hin (- Y_N Past Have).pdf
+    - assets/images/Hindi/stagehindistage2/Day-6_Accuracy_Hin (+W.H Past Have).pdf
+    - assets/images/Hindi/stagehindistage2/Day-7_Accuracy_Hin (-W.H Past Have).pdf
+    - assets/images/Hindi/stagehindistage2/Day-8_Accuracy_Hin [(+_-) Sta Present Have].pdf
+    - assets/images/Hindi/stagehindistage2/Day-9_Accuracy_Hin [(+_-) Y_N Present Have].pdf
+    - assets/images/Hindi/stagehindistage2/Day-10_Accuracy_Hin [(+_-) W.H Present Have].pdf
+    - assets/images/Hindi/stagehindistage2/Day-11_Accuracy_Hin [(+_-) Sta Future Have].pdf
+    - assets/images/Hindi/stagehindistage2/Day-12_Accuracy_Hin [(+_-) Y_N Future Have].pdf
+    - assets/images/Hindi/stagehindistage2/Day-13_Accuracy_Hin [(+_-) W.H Future Have].pdf
+    - assets/images/Hindi/stagehindistage2/Day-14_Accuracy_Hin[(+_-) Sta Quantifiers].pdf
+    - assets/images/Hindi/stagehindistage2/Day-15_Accuracy_Hin[(+_-) Y_N Quantifiers].pdf
+    - assets/images/Hindi/stagehindistage2/Day-16_Accuracy_Hin[(+_-) W.H Quantifiers].pdf
+    - assets/images/Hindi/stagehindistage2/Day-17_Accuracy_Hin[Possessive Pronouns].pdf
+    - assets/images/Hindi/stagehindistage2/Day-18_Accuracy_Hin[W.H Words].pdf
+    - assets/images/Hindi/stagehindistage2/Day-19_Accuracy_Hin[Time Prepositions].pdf
+    - assets/images/Hindi/stagehindistage2/Day-20_Accuracy_Hin[Place Prepositions].pdf
+    - assets/images/Hindi/stagehindistage2/Day-21_Accuracy_Hin[Frequency Prepositions.pdf
+
+    # - Hindi Stage 3
+    - assets/images/Hindi/stagehindistage3/Day-2_Progression_Hin (Action Verbs).pdf
+    - assets/images/Hindi/stagehindistage3/Day-3_Progression_Hin (+Sta Past Simple).pdf
+    - assets/images/Hindi/stagehindistage3/Day-4_Progression_Hin (-Sta Past Simple).pdf
+    - assets/images/Hindi/stagehindistage3/Day-5_Progression_Hin (+Y_N Past Simple).pdf
+    - assets/images/Hindi/stagehindistage3/Day-6_Progression_Hin (-Y_N Past Simple).pdf
+    - assets/images/Hindi/stagehindistage3/Day-7_Progression_Hin (+W.H Past Simple).pdf
+    - assets/images/Hindi/stagehindistage3/Day-8_Progression_Hin (-W.H Past Simple).pdf
+    - assets/images/Hindi/stagehindistage3/Day-9_Progression_Hin (+Sta Present Simple).pdf
+    - assets/images/Hindi/stagehindistage3/Day-10_Progression_Hin (-Sta Present Simple).pdf
+    - assets/images/Hindi/stagehindistage3/Day-11_Progression_Hin (+Y_N Present Simple).pdf
+    - assets/images/Hindi/stagehindistage3/Day-12_Progression_Hin (-Y_N Present Simple).pdf
+    - assets/images/Hindi/stagehindistage3/Day-14_Progression_Hin (-W.H Present Simple).pdf
+    - assets/images/Hindi/stagehindistage3/Day-15_Progression_Hin (+Sta Future Simple).pdf
+    - assets/images/Hindi/stagehindistage3/Day-16_Progression_Hin (-Sta Future Simple).pdf
+    - assets/images/Hindi/stagehindistage3/Day-17_Progression_Hin (+Y_N Future Simple).pdf
+    - assets/images/Hindi/stagehindistage3/Day-18_Progression_Hin (-Y_N Future Simple).pdf
+    - assets/images/Hindi/stagehindistage3/Day-19_Progression_Hin (+W.H Future Simple).pdf
+    - assets/images/Hindi/stagehindistage3/Day-20_Progression_Hin (-W.H Future Simple).pdf
+
+    # - Hindi Stage 4
+    - assets/images/Hindi/stagehindistage4/Day-2_Clarity_Hin (Action Verbs)_.docx.pdf
+    - assets/images/Hindi/stagehindistage4/Day-3_Clarity_Hin (+_- Sta Past Con)_ .docx.pdf
+    - assets/images/Hindi/stagehindistage4/Day-4_Clarity_Hin (+_- Yes Past Con)_ .docx.pdf
+    - assets/images/Hindi/stagehindistage4/Day-5_Clarity_Hin (+_- W.H Past Con)_ .docx.pdf
+    - assets/images/Hindi/stagehindistage4/Day-6_Clarity_Hin (+_- Sta Present Con)_ .docx.pdf
+    - assets/images/Hindi/stagehindistage4/Day-7_Clarity_Hin (+_- Y_N Que Present Con)_ .docx.pdf
+    - assets/images/Hindi/stagehindistage4/Day-8_Clarity_Hin (+_- W.H Que Present Con)_.docx.pdf
+    - assets/images/Hindi/stagehindistage4/Day-9_Clarity_Hin (+_- Sta Future Con)_.docx.pdf
+    - assets/images/Hindi/stagehindistage4/Day-10_Clarity_Hin (+_- Y_N Que Future Con)_.docx.pdf
+    - assets/images/Hindi/stagehindistage4/Day-11_Clarity_Hin (+_- W.H Que Future Con)_.docx.pdf
+    - assets/images/Hindi/stagehindistage4/Day-12_Clarity_Hin (+_- Order-1)_.docx.pdf
+    - assets/images/Hindi/stagehindistage4/Day-13_Clarity_Hin (+_- Order-2)_.docx.pdf
+    - assets/images/Hindi/stagehindistage4/Day-14_Clarity_Hin (+_- Request-1)_.docx.pdf
+    - assets/images/Hindi/stagehindistage4/Day-15_Clarity_Hin (+_- Request-2)_.docx.pdf
+    - assets/images/Hindi/stagehindistage4/Day-16_Clarity_Hin (+_- Permission-1)_.docx.pdf
+    - assets/images/Hindi/stagehindistage4/Day-17_Clarity_Hin (+_- Permission-2)_.docx.pdf
+    - assets/images/Hindi/stagehindistage4/Day-18_Clarity_Hin (+ Suggestion-1)_.docx.pdf
+    - assets/images/Hindi/stagehindistage4/Day-19_Clarity_Hin (+_- Suggestion-2)_.docx.pdf
+
+    # - Hindi Stage 5
+    - assets/images/Hindi/stagehindistage5/Day-1_Confidence_Hin (Introduction).pdf
+    - assets/images/Hindi/stagehindistage5/Day-2_Confidence_Hin (+_- Sta Past Habit).pdf
+    - assets/images/Hindi/stagehindistage5/Day-3_Confidence_Hin (+_- Yes_No Past Habit).pdf
+    - assets/images/Hindi/stagehindistage5/Day-4_Confidence_Hin (+_- W.H Past Habit).pdf
+    - assets/images/Hindi/stagehindistage5/Day-5_Confidence_Hin (+_- Sta Past Willingness-1).pdf
+    - assets/images/Hindi/stagehindistage5/Day-6_Confidence_Hin (+_- Yes_No Past Willingness-1).pdf
+    - assets/images/Hindi/stagehindistage5/Day-7_Confidence_Hin (+_- W.H Past Willingness-1).pdf
+    - assets/images/Hindi/stagehindistage5/Day-8_Confidence_Hin (+_- Sta Past Ability).pdf
+    - assets/images/Hindi/stagehindistage5/Day-9_Confidence_Hin (+_- Y_N Past Ability).pdf
+    - assets/images/Hindi/stagehindistage5/Day-10_Confidence_Hin (+_- W.H Past Ability).pdf
+    - assets/images/Hindi/stagehindistage5/Day-11_Confidence_Hin (+_- Sta Past Compulsion).pdf
+    - assets/images/Hindi/stagehindistage5/Day-12_Confidence_Hin (+_- Y_N Past Compulsion).pdf
+    - assets/images/Hindi/stagehindistage5/Day-13_Confidence_Hin (+_- W.H Past Compulsion).pdf
+    - assets/images/Hindi/stagehindistage5/Day-14_Confidence_Hin (If In The Past).pdf
+    - assets/images/Hindi/stagehindistage5/Day-15_Confidence_Hin (If In The Present).pdf
+    - assets/images/Hindi/stagehindistage5/Day-16_Confidence_Hin (If In The Future).pdf
+    - assets/images/Hindi/stagehindistage5/Day-17_Confidence_Hin (When In The Past).pdf
+    - assets/images/Hindi/stagehindistage5/Day-18_Confidence_Hin (When In The Present).pdf
+    - assets/images/Hindi/stagehindistage5/Day-19_Confidence_Hin (When In The Future).pdf
+    - assets/images/Hindi/stagehindistage5/Day-20_Confidence_Hin (After In The Past).pdf
+    - assets/images/Hindi/stagehindistage5/Day-22_Confidence_Hin (After In The Future).pdf
+
+    # - Hindi Stage 6
+    - assets/images/Hindi/stagehindistage6/Day-2_Confidence_Hin (+_- Sta Present Willingness-1).pdf
+    - assets/images/Hindi/stagehindistage6/Day-3_Confidence_Hin (Speaking Practice).pdf
+    - assets/images/Hindi/stagehindistage6/Day-4_Confidence_Hin (+_- Yes_No Present Willingness-1).pdf
+    - assets/images/Hindi/stagehindistage6/Day-5_Confidence_Hin (Speaking Practice).pdf
+    - assets/images/Hindi/stagehindistage6/Day-6_Confidence_Hin (+_- W.H Present Willingness-1).pdf
+    - assets/images/Hindi/stagehindistage6/Day-7_Confidence_Hin (Speaking Practice).pdf
+    - assets/images/Hindi/stagehindistage6/Day-8_Confidence_Hin (+_- Sta Present Perm Ability).pdf
+    - assets/images/Hindi/stagehindistage6/Day-9_Confidence_Hin (+_- Y_N Present Perm Ability).pdf
+    - assets/images/Hindi/stagehindistage6/Day-10_Confidence_Hin (+_- W.H Present Perm Ability).pdf
+    - assets/images/Hindi/stagehindistage6/Day-11_Confidence_Hin (Speaking Practice).pdf
+    - assets/images/Hindi/stagehindistage6/Day-12_Confidence_Hin (+_- Sta Present Temp Ability.pdf
+    - assets/images/Hindi/stagehindistage6/Day-13_Confidence_Hin (+_- Y_N & W.H Present Temp Ability).pdf
+    - assets/images/Hindi/stagehindistage6/Day-14_Confidence_Hin (Speaking Practice).pdf
+    - assets/images/Hindi/stagehindistage6/Day-15_Confidence_Hin (+_- Sta Present Compulsion).pdf
+    - assets/images/Hindi/stagehindistage6/Day-16_Confidence_Hin (+_- Y_N Present Compulsion).pdf
+    - assets/images/Hindi/stagehindistage6/Day-17_Confidence_Hin (Speaking Practice).pdf
+    - assets/images/Hindi/stagehindistage6/Day-18_Confidence_Hin (Before in the Past).pdf
+    - assets/images/Hindi/stagehindistage6/Day-19_Confidence_Hin (Before in the Present).pdf
+    - assets/images/Hindi/stagehindistage6/Day-20_Confidence_Hin (Before in the Future).pdf
+    - assets/images/Hindi/stagehindistage6/Day-21_Confidence_Hin (Speaking Practice).pdf
+    - assets/images/Hindi/stagehindistage6/Day-22_Confidence_Hin (Speaking Practice).pdf
+
+flutter_icons:
+  android: true
+  ios: true
+  image_path: "assets/images/trainer logo with 600px.png"
+  adaptive_icon_background: "#FFFFFF"
+  adaptive_icon_foreground: "assets/images/trainer logo with 600px.png"
