@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
@@ -29,6 +30,7 @@ class _TeacherAttendanceScreenState extends State<TeacherAttendanceScreen>
   List<Map<String, dynamic>> attendanceList = [];
   Map<String, dynamic>? teacherAttendanceRecord;
   DateTime selectedDate = DateTime.now();
+  Timer? _pollingTimer; // 🚀 Added background timer for auto-updates
 
   static const Color navy = Color(0xFF155A88);
   static const Color deepNavy = Color(0xFF0E466D);
@@ -45,11 +47,17 @@ class _TeacherAttendanceScreenState extends State<TeacherAttendanceScreen>
     super.initState();
     WidgetsBinding.instance.addObserver(this); // 🚀 Register lifecycle observer
     fetchTeacherAndClassroomAttendance();
+
+    // 🚀 Auto-refresh attendance records every 10 seconds silently in the background
+    _pollingTimer = Timer.periodic(const Duration(seconds: 10), (_) {
+      fetchTeacherAndClassroomAttendance(silent: true);
+    });
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this); // 🚀 Clean up observer
+    _pollingTimer?.cancel();
     super.dispose();
   }
 
@@ -61,9 +69,9 @@ class _TeacherAttendanceScreenState extends State<TeacherAttendanceScreen>
     }
   }
 
-  Future<void> fetchTeacherAndClassroomAttendance() async {
+  Future<void> fetchTeacherAndClassroomAttendance({bool silent = false}) async {
     if (!mounted) return;
-    setState(() => isLoading = true);
+    if (!silent) setState(() => isLoading = true);
 
     try {
       final String language =

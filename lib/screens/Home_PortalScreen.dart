@@ -563,6 +563,7 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
   String activeFilter = "all";
   bool isStartingBroadcast = false;
   IO.Socket? _ioSocket;
+  Timer? _pollingTimer;
 
   static const Color backgroundColor = Color(0xffE8F2F8);
   static const Color cardColor = Color(0xffFFFFFF);
@@ -579,19 +580,24 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addObserver(this); // 🚀 Register lifecycle observer
+    WidgetsBinding.instance.addObserver(this);
     fetchAssignedStudentsSilent();
     _initSocket();
+
+    // 🚀 Background safety net: Auto-refresh data silently every 10 seconds
+    _pollingTimer = Timer.periodic(const Duration(seconds: 10), (_) {
+      fetchAssignedStudentsSilent();
+    });
   }
 
   @override
   void dispose() {
-    WidgetsBinding.instance.removeObserver(this); // 🚀 Clean up observer
+    WidgetsBinding.instance.removeObserver(this);
+    _pollingTimer?.cancel();
     _ioSocket?.dispose();
     super.dispose();
   }
 
-  // 🚀 Automatically refresh student roster when app comes back to foreground
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
@@ -615,11 +621,8 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
         _ioSocket?.emit('join_user_room', teacherId);
       });
 
-      // 🚀 Listen to real-time events from the Node.js backend
       _ioSocket?.on('permissions_updated', (_) {
-        debugPrint(
-          "⚡ Admin updated records: refreshing trainer roster instantly.",
-        );
+        debugPrint("⚡ Real-time update: refreshing trainer roster instantly.");
         fetchAssignedStudentsSilent();
       });
 
@@ -793,10 +796,10 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
     final String section = language.toLowerCase() == "hindi"
         ? "none"
         : (widget.teacherData['section'] ??
-                  widget.teacherData['teacherSection'] ??
-                  'A')
-              .toString()
-              .toLowerCase();
+                widget.teacherData['teacherSection'] ??
+                'A')
+            .toString()
+            .toLowerCase();
 
     final String teacherId =
         (widget.teacherData['_id'] ?? widget.teacherData['id'] ?? '')
@@ -1220,8 +1223,8 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
                                       call: activeCall,
                                       language:
                                           widget.teacherData['language']
-                                              ?.toString() ??
-                                          'English',
+                                                  ?.toString() ??
+                                              'English',
                                       stage:
                                           (widget.teacherData['teacherStage'] ??
                                                   widget.teacherData['stage'] ??
@@ -1229,8 +1232,7 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
                                               .toString(),
                                       section:
                                           (widget.teacherData['teacherSection'] ??
-                                                  widget
-                                                      .teacherData['section'] ??
+                                                  widget.teacherData['section'] ??
                                                   'a')
                                               .toString(),
                                       enrolledStudents: allAssignedStudents,
