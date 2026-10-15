@@ -263,7 +263,7 @@ class _FloatingTrainerPiPWidgetState extends State<FloatingTrainerPiPWidget> {
                             GlobalAudioOverlayController.removeOverlay();
                             final String lang =
                                 teacherData['language']?.toString() ??
-                                'English';
+                                    'English';
                             final String stg =
                                 (teacherData['teacherStage'] ??
                                         teacherData['stage'] ??
@@ -584,7 +584,6 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
     fetchAssignedStudentsSilent();
     _initSocket();
 
-    // 🚀 Background safety net: Auto-refresh data silently every 10 seconds
     _pollingTimer = Timer.periodic(const Duration(seconds: 10), (_) {
       fetchAssignedStudentsSilent();
     });
@@ -622,7 +621,6 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
       });
 
       _ioSocket?.on('permissions_updated', (_) {
-        debugPrint("⚡ Real-time update: refreshing trainer roster instantly.");
         fetchAssignedStudentsSilent();
       });
 
@@ -1231,8 +1229,10 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
                                                   'stage1')
                                               .toString(),
                                       section:
-                                          (widget.teacherData['teacherSection'] ??
-                                                  widget.teacherData['section'] ??
+                                          (widget.teacherData[
+                                                      'teacherSection'] ??
+                                                  widget.teacherData[
+                                                      'section'] ??
                                                   'a')
                                               .toString(),
                                       enrolledStudents: allAssignedStudents,
@@ -1901,8 +1901,60 @@ class _TeacherBroadcastScreenState extends State<TeacherBroadcastScreen> {
     }
   }
 
+  /// 🚀 Mute all connected non-admin participants using SDK's `muteUsers`
+  Future<void> _muteAllStudents() async {
+    try {
+      final participants = widget.call.state.value.callParticipants;
+      final studentIds = participants
+          .where((p) => !p.roles.contains('admin'))
+          .map((p) => p.userId)
+          .toList();
+
+      if (studentIds.isNotEmpty) {
+        await widget.call.muteUsers(userIds: studentIds);
+        Get.snackbar(
+          "Muted All",
+          "All connected students have been muted.",
+          backgroundColor: teal,
+          colorText: Colors.white,
+        );
+      }
+    } catch (e) {
+      debugPrint("Mute All Error: $e");
+    }
+  }
+
+  /// 🚀 Leave Class: Teacher leaves, students stay
+  Future<void> _leaveClassOnly() async {
+    try {
+      await widget.call.leave();
+      GlobalAudioOverlayController.removeOverlay();
+      if (widget.onCallEnded != null) widget.onCallEnded!();
+      Get.back();
+      Get.snackbar(
+        "Left Classroom",
+        "You have left the classroom session.",
+        backgroundColor: navy,
+        colorText: Colors.white,
+      );
+    } catch (e) {
+      GlobalAudioOverlayController.removeOverlay();
+      Get.back();
+    }
+  }
+
+  /// 🚀 End Class: Completely ends the session for everyone and deletes the backend link
   Future<void> _endClassAndBroadcast(BuildContext context) async {
     try {
+      final participants = widget.call.state.value.callParticipants;
+      for (var p in participants) {
+        if (!p.roles.contains('admin')) {
+          try {
+            await widget.call.kickUser(p.userId);
+          } catch (_) {}
+        }
+      }
+
       await widget.call.leave();
 
       final request = http.Request(
@@ -1923,17 +1975,17 @@ class _TeacherBroadcastScreenState extends State<TeacherBroadcastScreen> {
       GlobalAudioOverlayController.removeOverlay();
       if (widget.onCallEnded != null) widget.onCallEnded!();
 
-      Get.back();
+      Get.until((route) => route.isFirst);
       Get.snackbar(
         "Class Ended",
-        "The live classroom has been closed.",
-        backgroundColor: navy,
+        "The live classroom has been closed completely.",
+        backgroundColor: red,
         colorText: Colors.white,
       );
     } catch (e) {
       GlobalAudioOverlayController.removeOverlay();
       if (widget.onCallEnded != null) widget.onCallEnded!();
-      Get.back();
+      Get.until((route) => route.isFirst);
     }
   }
 
@@ -2027,12 +2079,6 @@ class _TeacherBroadcastScreenState extends State<TeacherBroadcastScreen> {
                           );
                         } catch (e) {
                           debugPrint("Kick Error: $e");
-                          Get.snackbar(
-                            "Error",
-                            "Could not remove student: $e",
-                            backgroundColor: red,
-                            colorText: Colors.white,
-                          );
                         }
                       },
                       style: ElevatedButton.styleFrom(
@@ -2202,6 +2248,11 @@ class _TeacherBroadcastScreenState extends State<TeacherBroadcastScreen> {
       ),
       actions: [
         IconButton(
+          tooltip: 'Mute all students',
+          onPressed: _muteAllStudents,
+          icon: const Icon(Icons.mic_off_rounded, color: yellow, size: 22),
+        ),
+        IconButton(
           tooltip: 'Minimize classroom',
           onPressed: () {
             Get.until((route) => route.isFirst);
@@ -2226,7 +2277,7 @@ class _TeacherBroadcastScreenState extends State<TeacherBroadcastScreen> {
           ),
         ),
         IconButton(
-          tooltip: 'End class',
+          tooltip: 'End or leave class',
           onPressed: () => _showEndClassDialog(context),
           icon: const Icon(Icons.stop_circle_rounded, color: red, size: 23),
         ),
@@ -2634,12 +2685,16 @@ class _TeacherBroadcastScreenState extends State<TeacherBroadcastScreen> {
                       children: [
                         _micButton(),
                         const SizedBox(height: 10),
+                        _muteAllButton(),
+                        const SizedBox(height: 10),
                         _endButton(context),
                       ],
                     )
                   : Row(
                       children: [
                         Expanded(child: _micButton()),
+                        const SizedBox(width: 12),
+                        Expanded(child: _muteAllButton()),
                         const SizedBox(width: 12),
                         Expanded(child: _endButton(context)),
                       ],
@@ -2662,7 +2717,7 @@ class _TeacherBroadcastScreenState extends State<TeacherBroadcastScreen> {
           size: 19,
         ),
         label: Text(
-          isTeacherMuted ? 'UNMUTE MICROPHONE' : 'MUTE MICROPHONE',
+          isTeacherMuted ? 'UNMUTE MIC' : 'MUTE MIC',
           style: GoogleFonts.poppins(
             fontSize: 11.5,
             fontWeight: FontWeight.w700,
@@ -2670,6 +2725,32 @@ class _TeacherBroadcastScreenState extends State<TeacherBroadcastScreen> {
         ),
         style: ElevatedButton.styleFrom(
           backgroundColor: isTeacherMuted ? navy : teal,
+          foregroundColor: Colors.white,
+          elevation: 0,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(13),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _muteAllButton() {
+    return SizedBox(
+      height: 50,
+      width: double.infinity,
+      child: ElevatedButton.icon(
+        onPressed: _muteAllStudents,
+        icon: const Icon(Icons.mic_off_rounded, size: 19),
+        label: Text(
+          'MUTE ALL',
+          style: GoogleFonts.poppins(
+            fontSize: 11.5,
+            fontWeight: FontWeight.w700,
+          ),
+        ),
+        style: ElevatedButton.styleFrom(
+          backgroundColor: blue,
           foregroundColor: Colors.white,
           elevation: 0,
           shape: RoundedRectangleBorder(
@@ -2688,7 +2769,7 @@ class _TeacherBroadcastScreenState extends State<TeacherBroadcastScreen> {
         onPressed: () => _showEndClassDialog(context),
         icon: const Icon(Icons.stop_rounded, size: 19),
         label: Text(
-          'END CLASS',
+          'CLASS OPTIONS',
           style: GoogleFonts.poppins(
             fontSize: 11.5,
             fontWeight: FontWeight.w700,
@@ -2728,14 +2809,14 @@ class _TeacherBroadcastScreenState extends State<TeacherBroadcastScreen> {
                   shape: BoxShape.circle,
                 ),
                 child: const Icon(
-                  Icons.stop_circle_rounded,
+                  Icons.exit_to_app_rounded,
                   color: red,
                   size: 30,
                 ),
               ),
               const SizedBox(height: 16),
               Text(
-                'End this class?',
+                'Classroom Exit Options',
                 style: GoogleFonts.poppins(
                   color: deepNavy,
                   fontSize: 18,
@@ -2744,7 +2825,7 @@ class _TeacherBroadcastScreenState extends State<TeacherBroadcastScreen> {
               ),
               const SizedBox(height: 7),
               Text(
-                'All connected students will be disconnected from the live classroom.',
+                'Choose whether you want to just leave the room or completely end the class for all students.',
                 textAlign: TextAlign.center,
                 style: GoogleFonts.poppins(
                   color: textSecondary,
@@ -2753,35 +2834,49 @@ class _TeacherBroadcastScreenState extends State<TeacherBroadcastScreen> {
                 ),
               ),
               const SizedBox(height: 22),
-              Row(
+              Column(
                 children: [
-                  Expanded(
-                    child: OutlinedButton(
-                      onPressed: () => Get.back(),
+                  SizedBox(
+                    width: double.infinity,
+                    child: OutlinedButton.icon(
+                      onPressed: () {
+                        Get.back();
+                        _leaveClassOnly();
+                      },
+                      icon: const Icon(Icons.logout_rounded, color: navy),
+                      label: Text(
+                        'Leave Class (Students Stay)',
+                        style: GoogleFonts.poppins(
+                          color: navy,
+                          fontSize: 11.5,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
                       style: OutlinedButton.styleFrom(
-                        foregroundColor: navy,
-                        side: BorderSide(color: navy.withOpacity(.18)),
+                        side: BorderSide(color: navy.withOpacity(.28)),
                         minimumSize: const Size(0, 46),
                         shape: RoundedRectangleBorder(
                           borderRadius: BorderRadius.circular(12),
                         ),
                       ),
-                      child: Text(
-                        'Cancel',
-                        style: GoogleFonts.poppins(
-                          fontSize: 11.5,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
                     ),
                   ),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: ElevatedButton(
+                  const SizedBox(height: 10),
+                  SizedBox(
+                    width: double.infinity,
+                    child: ElevatedButton.icon(
                       onPressed: () {
                         Get.back();
                         _endClassAndBroadcast(context);
                       },
+                      icon: const Icon(Icons.stop_circle_rounded),
+                      label: Text(
+                        'End Class for Everyone',
+                        style: GoogleFonts.poppins(
+                          fontSize: 11.5,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
                       style: ElevatedButton.styleFrom(
                         backgroundColor: red,
                         foregroundColor: Colors.white,
@@ -2791,12 +2886,16 @@ class _TeacherBroadcastScreenState extends State<TeacherBroadcastScreen> {
                           borderRadius: BorderRadius.circular(12),
                         ),
                       ),
-                      child: Text(
-                        'End Class',
-                        style: GoogleFonts.poppins(
-                          fontSize: 11.5,
-                          fontWeight: FontWeight.w700,
-                        ),
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  TextButton(
+                    onPressed: () => Get.back(),
+                    child: Text(
+                      'Cancel',
+                      style: GoogleFonts.poppins(
+                        color: textSecondary,
+                        fontWeight: FontWeight.w600,
                       ),
                     ),
                   ),
