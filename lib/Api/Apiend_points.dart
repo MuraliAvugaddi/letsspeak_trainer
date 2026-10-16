@@ -1,26 +1,46 @@
 class ApiEndpoints {
-  // static const String baseUrl =
-  // "http://192.168.1.4:5001/api";
+  // =====================================================
+  // 🔁 SWITCH SERVER: keep ONE line active, comment the other
+  // =====================================================
 
-  static const String baseUrl =
-      "https://lets-talk-backend-o06t.onrender.com/api";
+  // 🖥️ LOCAL (laptop running `npm run dev`, phone on same Wi-Fi)
+  static const String baseUrl = "http://192.168.1.3:5000/api";
 
+  // 🚀 PRODUCTION (Render): uncomment this and comment the LOCAL line above
+  // static const String baseUrl = "https://lets-talk-backend-o06t.onrender.com/api";
+
+  // =====================================================
   // Auth Endpoints
+  // =====================================================
   static const String login = "$baseUrl/login";
   static const String register = "$baseUrl/register";
 
+  // =====================================================
   // Attendance & User Information
+  // =====================================================
   static const String usersByStage = "$baseUrl/admin/users-by-stage";
   static const String adminAttendance = "$baseUrl/admin/attendance";
   static const String userAttendance = "$baseUrl/user/my-attendance";
   static const String markAttendance = "$baseUrl/user/mark-attendance";
   static const String allStudents = "$baseUrl/admin/all-students";
 
-  // 🚀 Added dedicated classroom roster endpoint for trainers
+  // Classroom roster for trainers
   static const String trainerRoster = "$baseUrl/admin/trainer-roster";
 
-  // Stream Audio Live Broadcasting Endpoints
+  // =====================================================
+  // Stream audio live classes
+  // =====================================================
   static const String streamToken = "$baseUrl/stream/token";
+  static const String prepareCall = "$baseUrl/stream/prepare-call"; // server creates today's class
   static const String updateLiveLink = "$baseUrl/live/admin/update";
   static const String deleteLiveLink = "$baseUrl/live/admin/delete";
+
+  // =====================================================
+  // 🎤 Speaking practice (live classroom)
+  // =====================================================
+  static const String practiceMark = "$baseUrl/practice/mark";
+  static const String practiceList = "$baseUrl/practice/list";
+
+  // Students who joined outside their own batch time (not counted as attendance)
+  static const String batchVisitors = "$baseUrl/admin/batch-visitors";
 }

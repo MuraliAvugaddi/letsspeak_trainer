@@ -7,6 +7,8 @@ import 'package:intl/intl.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:get/get.dart';
 import 'package:letsspeak_trainer/Api/Apiend_points.dart';
+import 'package:letsspeak_trainer/Api/api_headers.dart';
+import 'package:letsspeak_trainer/Api/batch_slots.dart';
 
 const double instituteLat = 17.729417;
 const double instituteLng = 83.312231;
@@ -28,6 +30,7 @@ class _TeacherAttendanceScreenState extends State<TeacherAttendanceScreen>
   bool isCheckingIn = false;
 
   List<Map<String, dynamic>> attendanceList = [];
+  String activeBatch = 'all'; // "all" | "none" | canonical batch label
   Map<String, dynamic>? teacherAttendanceRecord;
   DateTime selectedDate = DateTime.now();
   Timer? _pollingTimer; // 🚀 Added background timer for auto-updates
@@ -106,16 +109,22 @@ class _TeacherAttendanceScreenState extends State<TeacherAttendanceScreen>
       final String year = selectedDate.year.toString();
       final String dateStr = "$day-$month-$year";
 
-      final querySection = (language.toLowerCase() == 'hindi') ? 'all' : section;
+      final querySection = (language.toLowerCase() == 'hindi')
+          ? 'all'
+          : section;
 
       final rosterRes = await http.get(
         Uri.parse(
           "${ApiEndpoints.baseUrl}/admin/trainer-roster?stage=$stage&language=$language&section=$querySection&mode=$teacherMode&date=$dateStr",
         ),
+        headers: ApiHeaders.auth(),
       );
 
       final attendanceRes = await http.get(
-        Uri.parse("${ApiEndpoints.baseUrl}/admin/attendance?date=$dateStr&stage=$stage&language=$language"),
+        Uri.parse(
+          "${ApiEndpoints.baseUrl}/admin/attendance?date=$dateStr&stage=$stage&language=$language&role=teacher",
+        ),
+        headers: ApiHeaders.auth(),
       );
 
       if (rosterRes.statusCode == 200 && attendanceRes.statusCode == 200) {
@@ -169,8 +178,18 @@ class _TeacherAttendanceScreenState extends State<TeacherAttendanceScreen>
             "status": student['attendanceStatus'] ?? "Absent",
             "totalMinutes": student['totalMinutesSpent'] ?? 0,
             "markedAtTime": formattedTime,
+            "batchTime": BatchSlots.labelOf(student['batchTime']),
+            "practiced": student['practiced'] == true,
           });
         }
+
+        // Earliest batch first, students without a timing last
+        tempList.sort((a, b) {
+          final ba = BatchSlots.find(a['batchTime'])?.number ?? 99;
+          final bb = BatchSlots.find(b['batchTime'])?.number ?? 99;
+          if (ba != bb) return ba.compareTo(bb);
+          return a['userName'].toString().compareTo(b['userName'].toString());
+        });
 
         if (mounted) {
           setState(() {
@@ -233,7 +252,7 @@ class _TeacherAttendanceScreenState extends State<TeacherAttendanceScreen>
 
       final res = await http.post(
         Uri.parse("${ApiEndpoints.baseUrl}/user/mark-attendance"),
-        headers: {"Content-Type": "application/json"},
+        headers: ApiHeaders.json(),
         body: jsonEncode({
           "userId": teacherId,
           "stage":
@@ -308,7 +327,9 @@ class _TeacherAttendanceScreenState extends State<TeacherAttendanceScreen>
     );
 
     if (picked != null && picked != selectedDate) {
-      setState(() => selectedDate = DateTime(picked.year, picked.month, picked.day));
+      setState(
+        () => selectedDate = DateTime(picked.year, picked.month, picked.day),
+      );
       fetchTeacherAndClassroomAttendance();
     }
   }
@@ -338,15 +359,28 @@ class _TeacherAttendanceScreenState extends State<TeacherAttendanceScreen>
 
     final String dateLabel = DateFormat('EEE, d MMM yyyy').format(selectedDate);
 
-    final int totalCount = attendanceList.length;
-    final int presentCount = attendanceList
+    final List<Map<String, dynamic>> visibleList = activeBatch == 'all'
+        ? attendanceList
+        : attendanceList
+              .where(
+                (s) =>
+                    (s['batchTime'] ?? '') ==
+                    (activeBatch == 'none' ? '' : activeBatch),
+              )
+              .toList();
+
+    final int totalCount = visibleList.length;
+    final int presentCount = visibleList
         .where((s) => s['status'] == 'Present')
         .length;
-    final int lateCount = attendanceList
+    final int lateCount = visibleList
         .where((s) => s['status'] == 'Late' || s['status'] == 'Partial')
         .length;
-    final int absentCount = attendanceList
+    final int absentCount = visibleList
         .where((s) => s['status'] == 'Absent')
+        .length;
+    final int practicedCount = visibleList
+        .where((s) => s['practiced'] == true)
         .length;
 
     String trainerStatus =
@@ -405,12 +439,16 @@ class _TeacherAttendanceScreenState extends State<TeacherAttendanceScreen>
                                 desktop,
                               ),
                             const SizedBox(height: 16),
+                            _buildBatchChips(),
+                            const SizedBox(height: 12),
                             _buildSummary(
                               totalCount,
                               presentCount,
                               lateCount,
                               absentCount,
                             ),
+                            const SizedBox(height: 12),
+                            _buildPracticeProgress(practicedCount, totalCount),
                             const SizedBox(height: 22),
                             Text(
                               'Classroom attendance',
@@ -423,12 +461,12 @@ class _TeacherAttendanceScreenState extends State<TeacherAttendanceScreen>
                             const SizedBox(height: 13),
                             if (isLoading)
                               _buildLoading()
-                            else if (attendanceList.isEmpty)
+                            else if (visibleList.isEmpty)
                               _buildEmptyState()
                             else if (desktop)
-                              _buildDesktopStudents(attendanceList)
+                              _buildDesktopStudents(visibleList)
                             else
-                              _buildMobileStudents(attendanceList),
+                              _buildMobileStudents(visibleList),
                           ],
                         ),
                       ),
@@ -728,6 +766,80 @@ class _TeacherAttendanceScreenState extends State<TeacherAttendanceScreen>
     );
   }
 
+  Widget _buildBatchChips() {
+    int countFor(String key) {
+      if (key == 'all') return attendanceList.length;
+      final want = key == 'none' ? '' : key;
+      return attendanceList.where((s) => (s['batchTime'] ?? '') == want).length;
+    }
+
+    final items = <(String, String)>[
+      ('all', 'All timings'),
+      ...BatchSlots.all.map((b) => (b.label, b.shortLabel)),
+      ('none', 'No timing'),
+    ];
+
+    return SizedBox(
+      height: 40,
+      child: ListView.separated(
+        scrollDirection: Axis.horizontal,
+        itemCount: items.length,
+        separatorBuilder: (_, __) => const SizedBox(width: 7),
+        itemBuilder: (context, index) {
+          final key = items[index].$1;
+          final label = items[index].$2;
+          final count = countFor(key);
+          final selected = activeBatch == key;
+          if (key == 'none' && count == 0 && !selected)
+            return const SizedBox.shrink();
+
+          return InkWell(
+            borderRadius: BorderRadius.circular(11),
+            onTap: () => setState(() => activeBatch = key),
+            child: AnimatedContainer(
+              duration: const Duration(milliseconds: 160),
+              padding: const EdgeInsets.symmetric(horizontal: 11),
+              decoration: BoxDecoration(
+                color: selected ? navy : Colors.white,
+                borderRadius: BorderRadius.circular(11),
+                border: Border.all(
+                  color: selected ? navy : navy.withOpacity(.12),
+                ),
+              ),
+              child: Row(
+                children: [
+                  Icon(
+                    Icons.schedule_rounded,
+                    size: 13,
+                    color: selected ? yellow : navy,
+                  ),
+                  const SizedBox(width: 5),
+                  Text(
+                    label,
+                    style: GoogleFonts.poppins(
+                      color: selected ? Colors.white : deepNavy,
+                      fontSize: 10.5,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  Text(
+                    '$count',
+                    style: GoogleFonts.poppins(
+                      color: selected ? yellow : textSecondary,
+                      fontSize: 9.5,
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
   Widget _buildSummary(int total, int present, int late, int absent) {
     return LayoutBuilder(
       builder: (context, constraints) {
@@ -752,6 +864,73 @@ class _TeacherAttendanceScreenState extends State<TeacherAttendanceScreen>
           ],
         );
       },
+    );
+  }
+
+  // 🎤 Speaking practice done in the live class (marked with "Mark practiced")
+  Widget _buildPracticeProgress(int practiced, int total) {
+    final double progress = total == 0 ? 0 : practiced / total;
+    return Container(
+      padding: const EdgeInsets.fromLTRB(14, 12, 14, 14),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(17),
+        border: Border.all(color: teal.withOpacity(.22)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                width: 34,
+                height: 34,
+                decoration: BoxDecoration(
+                  color: teal.withOpacity(.12),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: const Icon(Icons.record_voice_over_rounded, color: teal, size: 18),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  'Speaking practice',
+                  style: GoogleFonts.poppins(
+                    color: deepNavy,
+                    fontSize: 12.5,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+              Text(
+                '$practiced of $total done',
+                style: GoogleFonts.poppins(
+                  color: teal,
+                  fontSize: 11.5,
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(10),
+            child: LinearProgressIndicator(
+              value: progress,
+              minHeight: 7,
+              backgroundColor: const Color(0xFFE7EEF5),
+              valueColor: const AlwaysStoppedAnimation<Color>(teal),
+            ),
+          ),
+          const SizedBox(height: 6),
+          Text(
+            total - practiced > 0
+                ? '${total - practiced} still to practice'
+                : 'Everyone has practiced 🎉',
+            style: GoogleFonts.poppins(color: textSecondary, fontSize: 10),
+          ),
+        ],
+      ),
     );
   }
 
@@ -842,9 +1021,11 @@ class _TeacherAttendanceScreenState extends State<TeacherAttendanceScreen>
           dataTextStyle: GoogleFonts.poppins(color: deepNavy, fontSize: 11),
           columns: const [
             DataColumn(label: Text('STUDENT')),
+            DataColumn(label: Text('TIMING')),
             DataColumn(label: Text('STATUS')),
             DataColumn(label: Text('TIME')),
             DataColumn(label: Text('ACTIVE')),
+            DataColumn(label: Text('PRACTICE')),
           ],
           rows: students.map((student) {
             final String name =
@@ -879,6 +1060,19 @@ class _TeacherAttendanceScreenState extends State<TeacherAttendanceScreen>
                     ],
                   ),
                 ),
+                DataCell(
+                  Text(
+                    BatchSlots.shortOf(
+                      student['batchTime'],
+                      fallback: 'No timing',
+                    ),
+                    style: GoogleFonts.poppins(
+                      color: navy,
+                      fontSize: 10.5,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
                 DataCell(_statusBadge(status.toUpperCase(), color)),
                 DataCell(
                   Text(
@@ -898,6 +1092,14 @@ class _TeacherAttendanceScreenState extends State<TeacherAttendanceScreen>
                       fontWeight: FontWeight.w600,
                     ),
                   ),
+                ),
+                DataCell(
+                  student['practiced'] == true
+                      ? _statusBadge('PRACTICED', teal)
+                      : Text(
+                          '—',
+                          style: GoogleFonts.poppins(color: textSecondary, fontSize: 11),
+                        ),
                 ),
               ],
             );
@@ -966,9 +1168,9 @@ class _TeacherAttendanceScreenState extends State<TeacherAttendanceScreen>
                         const SizedBox(width: 4),
                         Expanded(
                           child: Text(
-                            time != null
-                                ? 'Joined at $time • $mins mins'
-                                : 'Not joined class yet',
+                            '${BatchSlots.shortOf(student['batchTime'], fallback: 'No timing')} • '
+                            '${time != null ? 'Joined $time • $mins mins' : 'Not joined yet'}'
+                            '${student['practiced'] == true ? ' • 🎤 Practiced' : ''}',
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis,
                             style: GoogleFonts.poppins(

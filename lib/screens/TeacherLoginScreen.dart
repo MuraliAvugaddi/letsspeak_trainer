@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:get/get.dart';
+import 'package:get_storage/get_storage.dart';
 import 'package:http/http.dart' as http;
 import 'package:google_fonts/google_fonts.dart';
 import 'package:letsspeak_trainer/Api/Apiend_points.dart';
@@ -71,7 +72,9 @@ class _TeacherLoginScreenState extends State<TeacherLoginScreen> {
         final userRole = (data['user']['role'] ?? '').toString().toLowerCase();
 
         if (userRole == 'teacher' || userRole == 'manager') {
-          // 🚀 Session cleared on restart so login is required every time
+          // Token is needed for every trainer API call and the live class.
+          // (Profile is still not saved, so login is required after restart.)
+          GetStorage().write('token', data['token']);
 
           Get.offAll(() => TeacherMainNavigation(teacherData: data['user']));
 
@@ -397,3 +400,5 @@ class _TeacherLoginScreenState extends State<TeacherLoginScreen> {
     );
   }
 }
+
+

@@ -1,13 +1,17 @@
 import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:http/http.dart' as http;
 import 'package:geolocator/geolocator.dart';
 import 'package:get/get.dart';
 import 'package:stream_video_flutter/stream_video_flutter.dart';
 import 'package:socket_io_client/socket_io_client.dart' as IO;
+import 'package:get_storage/get_storage.dart';
 import 'package:letsspeak_trainer/Api/Apiend_points.dart';
+import 'package:letsspeak_trainer/Api/api_headers.dart';
+import 'package:letsspeak_trainer/Api/batch_slots.dart';
 import 'package:letsspeak_trainer/screens/TeacherLoginScreen.dart';
 
 const double instituteLat = 17.729417;
@@ -15,30 +19,575 @@ const double instituteLng = 83.312231;
 const double allowedRadius = 40.0;
 
 // =========================================================================
-// 🚀 FIXED HIGH-SCALE STREAM MANAGER (Prevents Initialization Conflict)
+// 🚀 STREAM MANAGER — token + client are prepared when the portal opens,
+// so "Start live class" only has to join (no token / connect wait).
 // =========================================================================
 class StreamManager {
   static StreamVideo? _cachedClient;
+  static String? _cachedUserId;
+  static String? _token;
+  static DateTime? _tokenAt;
+  static String _apiKey = 'urzyyp7kctqv';
+  static Future<StreamVideo>? _pending;
 
+  // Server tokens last 6 h; renew after 5 h
+  static bool get _tokenFresh =>
+      _token != null &&
+      _tokenAt != null &&
+      DateTime.now().difference(_tokenAt!) < const Duration(hours: 5);
+
+  static Future<void> _fetchToken(String userId) async {
+    final res = await http
+        .post(
+          Uri.parse(ApiEndpoints.streamToken),
+          headers: ApiHeaders.json(),
+          // Server decides the Stream role from the database (trainer → admin)
+          body: jsonEncode({"userId": userId}),
+        )
+        .timeout(const Duration(seconds: 25));
+    if (res.statusCode == 401) {
+      throw Exception("Session expired. Please log out and log in again.");
+    }
+    if (res.statusCode != 200) {
+      throw Exception("Failed to authorize stream (${res.statusCode})");
+    }
+    final data = jsonDecode(res.body);
+    final token = data['token']?.toString() ?? '';
+    if (token.isEmpty) throw Exception("Class token missing");
+    _token = token;
+    _apiKey = data['apiKey']?.toString() ?? _apiKey;
+    _tokenAt = DateTime.now();
+  }
+
+  /// Returns a connected client. Several callers at once share one request.
+  static Future<StreamVideo> clientFor({
+    required String userId,
+    required String userName,
+  }) {
+    final cached = _cachedClient;
+    if (cached != null && _cachedUserId == userId) {
+      // Never swap the client while a class is running on it
+      if (_tokenFresh || ClassroomController.instance.call != null) {
+        return Future.value(cached);
+      }
+    }
+    return _pending ??= _create(userId, userName).whenComplete(() {
+      _pending = null;
+    });
+  }
+
+  static Future<StreamVideo> _create(String userId, String userName) async {
+    if (!_tokenFresh || _cachedUserId != userId) await _fetchToken(userId);
+    try {
+      await StreamVideo.reset(disconnect: true);
+    } catch (_) {}
+    _cachedClient = StreamVideo(
+      _apiKey,
+      user: User.regular(userId: userId, name: userName),
+      userToken: _token!,
+    );
+    _cachedUserId = userId;
+    return _cachedClient!;
+  }
+
+  /// Old API (kept so any other screen that still calls it keeps working)
   static Future<StreamVideo> getClient({
     required String userId,
     required String userName,
     required String token,
+    String apiKey = 'urzyyp7kctqv',
   }) async {
-    if (_cachedClient != null) {
-      return _cachedClient!;
-    }
-
+    if (_cachedClient != null && _cachedUserId == userId) return _cachedClient!;
+    _token = token;
+    _tokenAt = DateTime.now();
+    _apiKey = apiKey;
     try {
       await StreamVideo.reset(disconnect: true);
     } catch (_) {}
-
     _cachedClient = StreamVideo(
-      'urzyyp7kctqv',
+      apiKey,
       user: User.regular(userId: userId, name: userName),
       userToken: token,
     );
+    _cachedUserId = userId;
     return _cachedClient!;
+  }
+
+  /// Fire-and-forget warm-up (called when the trainer portal opens)
+  static void prewarm({required String userId, required String userName}) {
+    if (userId.isEmpty) return;
+    clientFor(userId: userId, userName: userName).then(
+      (_) => debugPrint("Stream ready ✅"),
+      onError: (e) => debugPrint("Stream prewarm failed: $e"),
+    );
+  }
+
+  static Future<void> reset() async {
+    try {
+      await StreamVideo.reset(disconnect: true);
+    } catch (_) {}
+    _cachedClient = null;
+    _cachedUserId = null;
+    _token = null;
+    _tokenAt = null;
+  }
+}
+
+// =========================================================================
+// 🎤 CLASSROOM CONTROLLER — mic lock + speaking-practice queue
+//
+// The state is shared with students through the Stream call's custom data
+// (call.update(custom: ...)), so every student sees it instantly:
+//   micLocked  → students cannot unmute
+//   allowed    → students the trainer allowed to speak while locked
+//   pCurrent   → who is practicing now, pNext → who is next
+// It lives outside the screen, so it survives minimize (PiP) and reopen.
+// =========================================================================
+class PracticeEntry {
+  final String id;
+  final String name;
+  const PracticeEntry(this.id, this.name);
+}
+
+class ClassroomController {
+  ClassroomController._();
+  static final ClassroomController instance = ClassroomController._();
+
+  Call? call;
+  String language = 'English';
+  String stage = 'stage1';
+  String section = '';
+  String teacherId = '';
+  DateTime? startedAt;
+
+  final RxBool micLocked = false.obs;
+  final RxSet<String> allowed = <String>{}.obs;
+
+  final Rxn<PracticeEntry> current = Rxn<PracticeEntry>();
+  final RxList<PracticeEntry> queue = <PracticeEntry>[].obs; // waiting (current not included)
+  final RxList<PracticeEntry> done = <PracticeEntry>[].obs; // practiced in this round
+  final RxSet<String> practicedToday = <String>{}.obs; // whole day, from the server
+  final Rxn<DateTime> currentSince = Rxn<DateTime>();
+  final RxBool saving = false.obs;
+
+  // Students in this class today who are NOT in this batch time (not counted)
+  final RxList<Map<String, dynamic>> otherBatch = <Map<String, dynamic>>[].obs;
+  Timer? _visitorTimer;
+
+  bool isOtherBatch(String userId) =>
+      otherBatch.any((v) => v['userId']?.toString() == userId);
+
+  StreamSubscription<CallState>? _stateSub;
+  Timer? _publishTimer;
+  final Map<String, DateTime> _lastAutoMute = {};
+
+  bool get practiceActive => current.value != null || queue.isNotEmpty;
+  int get practiceTotal =>
+      done.length + queue.length + (current.value == null ? 0 : 1);
+
+  bool isStaff(CallParticipantState p) =>
+      p.roles.contains('admin') || p.userId == teacherId;
+
+  int queuePosition(String id) {
+    final i = queue.indexWhere((e) => e.id == id);
+    return i < 0 ? 0 : i + 1;
+  }
+
+  bool isQueued(String id) =>
+      current.value?.id == id || queue.any((e) => e.id == id);
+
+  // ---------------------------------------------------------------------
+  // Lifecycle
+  // ---------------------------------------------------------------------
+  void begin({
+    required Call call,
+    required String language,
+    required String stage,
+    required String section,
+    required String teacherId,
+  }) {
+    _stateSub?.cancel();
+    this.call = call;
+    this.language = language;
+    this.stage = stage;
+    this.section = section;
+    this.teacherId = teacherId;
+    startedAt = DateTime.now();
+    micLocked.value = false;
+    allowed.clear();
+    current.value = null;
+    currentSince.value = null;
+    queue.clear();
+    done.clear();
+    _lastAutoMute.clear();
+
+    // Enforce the lock even while the trainer is on another screen / PiP
+    _stateSub = call.state.asStream().listen(_enforce);
+
+    _publishNow(); // fresh class: mics open, no practice
+    loadPracticedToday();
+    otherBatch.clear();
+    loadOtherBatch();
+    _visitorTimer?.cancel();
+    _visitorTimer = Timer.periodic(const Duration(seconds: 45), (_) => loadOtherBatch());
+  }
+
+  Future<void> loadOtherBatch() async {
+    try {
+      final res = await http
+          .get(
+            Uri.parse("${ApiEndpoints.batchVisitors}?language=$language&stage=$stage"),
+            headers: ApiHeaders.auth(),
+          )
+          .timeout(const Duration(seconds: 15));
+      if (res.statusCode == 200) {
+        final data = jsonDecode(res.body);
+        final List list = data['visitors'] ?? [];
+        otherBatch.assignAll(list.whereType<Map<String, dynamic>>());
+      }
+    } catch (e) {
+      debugPrint("Other batch load error: $e");
+    }
+  }
+
+  /// Trainer leaves (students may stay): open the mics so nobody is stuck muted.
+  Future<void> finish() async {
+    if (micLocked.value || practiceActive) {
+      micLocked.value = false;
+      allowed.clear();
+      current.value = null;
+      queue.clear();
+      await _publishNow();
+    }
+    _stateSub?.cancel();
+    _stateSub = null;
+    _publishTimer?.cancel();
+    _visitorTimer?.cancel();
+    call = null;
+    startedAt = null;
+  }
+
+  // ---------------------------------------------------------------------
+  // Mic lock
+  // ---------------------------------------------------------------------
+  Future<void> setMicLock(bool locked) async {
+    micLocked.value = locked;
+    allowed.clear();
+    if (locked) {
+      final cur = current.value;
+      if (cur != null) allowed.add(cur.id); // practicing student keeps the mic
+      await _muteStudents();
+    }
+    await _publishNow();
+  }
+
+  Future<void> setAllowed(String userId, bool allow) async {
+    if (allow) {
+      allowed.add(userId);
+    } else {
+      allowed.remove(userId);
+      _mute([userId]);
+    }
+    await _publishNow();
+  }
+
+  Future<void> muteOne(String userId) async => _mute([userId]);
+
+  Future<void> _muteStudents() async {
+    final c = call;
+    if (c == null) return;
+    final ids = c.state.value.callParticipants
+        .where((p) => !isStaff(p) && !allowed.contains(p.userId))
+        .map((p) => p.userId)
+        .toSet()
+        .toList();
+    _mute(ids);
+  }
+
+  void _mute(List<String> ids) {
+    final c = call;
+    if (c == null || ids.isEmpty) return;
+    c.muteUsers(userIds: ids).then((r) {
+      if (r.isFailure) debugPrint("Mute failed: $r");
+    });
+  }
+
+  // A student on an old app version (or a race) unmuted while locked → mute again
+  void _enforce(CallState state) {
+    if (!micLocked.value || call == null) return;
+    final now = DateTime.now();
+    final offenders = <String>[];
+    for (final p in state.callParticipants) {
+      if (isStaff(p) || allowed.contains(p.userId) || !p.isAudioEnabled) continue;
+      final last = _lastAutoMute[p.userId];
+      if (last != null && now.difference(last).inSeconds < 3) continue;
+      _lastAutoMute[p.userId] = now;
+      offenders.add(p.userId);
+    }
+    if (offenders.isNotEmpty) _mute(offenders);
+  }
+
+  // ---------------------------------------------------------------------
+  // Practice queue
+  // ---------------------------------------------------------------------
+  void addToQueue(List<PracticeEntry> entries) {
+    for (final e in entries) {
+      if (isQueued(e.id)) continue;
+      done.removeWhere((d) => d.id == e.id); // picked again → practice again
+      queue.add(e);
+    }
+    if (current.value == null) _advance();
+    _schedulePublish();
+  }
+
+  void makeCurrent(PracticeEntry e) {
+    final cur = current.value;
+    if (cur?.id == e.id) return;
+    queue.removeWhere((q) => q.id == e.id);
+    done.removeWhere((d) => d.id == e.id);
+    if (cur != null) {
+      _releaseSpeaker(cur.id);
+      queue.insert(0, cur); // previous one goes back to the front
+    }
+    _setCurrent(e);
+    _schedulePublish();
+  }
+
+  void removeFromQueue(String id) {
+    if (current.value?.id == id) {
+      _releaseSpeaker(id);
+      _advance();
+    } else {
+      queue.removeWhere((q) => q.id == id);
+    }
+    _schedulePublish();
+  }
+
+  void moveUp(String id) {
+    final i = queue.indexWhere((q) => q.id == id);
+    if (i <= 0) return;
+    final e = queue.removeAt(i);
+    queue.insert(i - 1, e);
+    _schedulePublish();
+  }
+
+  /// Saves to the server first; only then moves on (so nothing is lost offline).
+  Future<bool> markCurrentPracticed() async {
+    final cur = current.value;
+    if (cur == null || saving.value) return false;
+    saving.value = true;
+    final ok = await _savePractice(cur, true);
+    saving.value = false;
+    if (!ok) return false;
+    practicedToday.add(cur.id);
+    done.removeWhere((d) => d.id == cur.id);
+    done.add(cur);
+    _releaseSpeaker(cur.id);
+    _advance();
+    await _publishNow();
+    return true;
+  }
+
+  /// Not ready / not answering → goes to the end of the line
+  void skipCurrent() {
+    final cur = current.value;
+    if (cur == null) return;
+    _releaseSpeaker(cur.id);
+    queue.add(cur);
+    _advance();
+    _schedulePublish();
+  }
+
+  Future<bool> undoPractice(PracticeEntry e) async {
+    final ok = await _savePractice(e, false);
+    if (ok) {
+      practicedToday.remove(e.id);
+      done.removeWhere((d) => d.id == e.id);
+      _schedulePublish();
+    }
+    return ok;
+  }
+
+  void endRound() {
+    final cur = current.value;
+    if (cur != null) _releaseSpeaker(cur.id);
+    current.value = null;
+    currentSince.value = null;
+    queue.clear();
+    done.clear();
+    _schedulePublish();
+  }
+
+  void _advance() {
+    if (queue.isEmpty) {
+      current.value = null;
+      currentSince.value = null;
+      return;
+    }
+    _setCurrent(queue.removeAt(0));
+  }
+
+  void _setCurrent(PracticeEntry e) {
+    current.value = e;
+    currentSince.value = DateTime.now();
+    if (micLocked.value) allowed.add(e.id); // their turn → mic unlocked for them
+  }
+
+  // Their turn is over → take the mic back
+  void _releaseSpeaker(String id) {
+    allowed.remove(id);
+    _mute([id]);
+  }
+
+  // ---------------------------------------------------------------------
+  // Server
+  // ---------------------------------------------------------------------
+  Future<bool> _savePractice(PracticeEntry e, bool practiced) async {
+    try {
+      final res = await http
+          .post(
+            Uri.parse(ApiEndpoints.practiceMark),
+            headers: ApiHeaders.json(),
+            body: jsonEncode({
+              "studentId": e.id,
+              "studentName": e.name,
+              "language": language,
+              "stage": stage,
+              "section": section,
+              "practiced": practiced,
+            }),
+          )
+          .timeout(const Duration(seconds: 15));
+      if (res.statusCode == 200) return true;
+      debugPrint("Practice save failed: ${res.statusCode} ${res.body}");
+    } catch (err) {
+      debugPrint("Practice save error: $err");
+    }
+    return false;
+  }
+
+  Future<void> loadPracticedToday() async {
+    try {
+      final res = await http
+          .get(
+            Uri.parse(
+              "${ApiEndpoints.practiceList}?language=$language&stage=$stage",
+            ),
+            headers: ApiHeaders.auth(),
+          )
+          .timeout(const Duration(seconds: 15));
+      if (res.statusCode == 200) {
+        final data = jsonDecode(res.body);
+        final List records = data['records'] ?? [];
+        practicedToday
+          ..clear()
+          ..addAll(records.map((r) => r['userId'].toString()));
+      }
+    } catch (e) {
+      debugPrint("Load practice error: $e");
+    }
+  }
+
+  void _schedulePublish() {
+    _publishTimer?.cancel();
+    _publishTimer = Timer(const Duration(milliseconds: 200), _publishNow);
+  }
+
+  Future<void> _publishNow() async {
+    _publishTimer?.cancel();
+    final c = call;
+    if (c == null) return;
+    final cur = current.value;
+    final next = queue.isNotEmpty ? queue.first : null;
+    try {
+      final r = await c.update(
+        custom: <String, Object>{
+          'micLocked': micLocked.value,
+          'allowed': allowed.toList(),
+          'pActive': practiceActive,
+          'pCurrent': cur?.id ?? '',
+          'pCurrentName': cur?.name ?? '',
+          'pNext': next?.id ?? '',
+          'pNextName': next?.name ?? '',
+          'pQueue': queue.map((e) => e.id).toList(),
+          'pDone': done.length,
+          'pTotal': practiceTotal,
+          'ts': DateTime.now().millisecondsSinceEpoch,
+        },
+      );
+      if (r.isFailure) debugPrint("Class state publish failed: $r");
+    } catch (e) {
+      debugPrint("Class state publish error: $e");
+    }
+  }
+}
+
+// =========================================================================
+// ⏱️ TRAINER ONLINE ATTENDANCE SESSION (join → sync every minute → leave)
+// The server counts minutes from its own clock; the app only sends checkpoints.
+// =========================================================================
+class TrainerOnlineSession {
+  static String? attendanceId;
+  static Timer? _syncTimer;
+
+  static Future<void> start({
+    required String teacherId,
+    required String language,
+    required String stage,
+  }) async {
+    try {
+      final res = await http.post(
+        Uri.parse("${ApiEndpoints.baseUrl}/user/join-online-class"),
+        headers: ApiHeaders.json(),
+        body: jsonEncode({
+          "userId": teacherId,
+          "language": language,
+          "stage": stage,
+        }),
+      );
+      if (res.statusCode == 200) {
+        final data = jsonDecode(res.body);
+        attendanceId = data['attendanceId']?.toString();
+      } else {
+        debugPrint("Join class failed: ${res.statusCode} ${res.body}");
+      }
+    } catch (e) {
+      debugPrint("Join class error: $e");
+    }
+
+    _syncTimer?.cancel();
+    _syncTimer = Timer.periodic(const Duration(minutes: 1), (_) => sync());
+  }
+
+  static Future<void> sync() async {
+    final id = attendanceId;
+    if (id == null) return;
+    try {
+      await http.post(
+        Uri.parse("${ApiEndpoints.baseUrl}/user/sync-online-class"),
+        headers: ApiHeaders.json(),
+        body: jsonEncode({"attendanceId": id}),
+      );
+    } catch (e) {
+      debugPrint("Sync class error: $e");
+    }
+  }
+
+  static Future<void> leave() async {
+    _syncTimer?.cancel();
+    _syncTimer = null;
+    final id = attendanceId;
+    attendanceId = null;
+    if (id == null) return;
+    try {
+      await http.post(
+        Uri.parse("${ApiEndpoints.baseUrl}/user/leave-online-class"),
+        headers: ApiHeaders.json(),
+        body: jsonEncode({"attendanceId": id}),
+      );
+    } catch (e) {
+      debugPrint("Leave class error: $e");
+    }
   }
 }
 
@@ -193,7 +742,9 @@ class _FloatingTrainerPiPWidgetState extends State<FloatingTrainerPiPWidget> {
                     : null;
 
                 final speakerName = _speakerName(speaker);
-                final int studentCount = students?.length ?? 0;
+                final int studentCount = participants
+                    .where((p) => !p.roles.contains('admin') && p.userId != teacherId)
+                    .length;
 
                 return Column(
                   mainAxisSize: MainAxisSize.min,
@@ -426,6 +977,41 @@ class _FloatingTrainerPiPWidgetState extends State<FloatingTrainerPiPWidget> {
                         ],
                       ),
                     ),
+                    Obx(() {
+                      final cc = ClassroomController.instance;
+                      final cur = cc.current.value;
+                      final locked = cc.micLocked.value;
+                      if (cur == null && !locked) return const SizedBox.shrink();
+                      return Padding(
+                        padding: const EdgeInsets.only(top: 8),
+                        child: Row(
+                          children: [
+                            Icon(
+                              cur != null
+                                  ? Icons.record_voice_over_rounded
+                                  : Icons.lock_rounded,
+                              size: 13,
+                              color: cur != null ? teal : const Color(0xFFC78B00),
+                            ),
+                            const SizedBox(width: 5),
+                            Expanded(
+                              child: Text(
+                                cur != null
+                                    ? "${cur.name} practicing • ${cc.done.length}/${cc.practiceTotal}"
+                                    : "Student mics locked",
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: GoogleFonts.poppins(
+                                  color: textDark,
+                                  fontSize: 10,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      );
+                    }),
                     const SizedBox(height: 9),
                     Row(
                       children: [
@@ -561,6 +1147,7 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
     with WidgetsBindingObserver {
   List<dynamic> allAssignedStudents = [];
   String activeFilter = "all";
+  String activeBatch = "all"; // "all" | "none" | canonical batch label
   bool isStartingBroadcast = false;
   IO.Socket? _ioSocket;
   Timer? _pollingTimer;
@@ -583,6 +1170,17 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
     WidgetsBinding.instance.addObserver(this);
     fetchAssignedStudentsSilent();
     _initSocket();
+
+    // ⚡ Get the class token + Stream connection ready now, so "Start live
+    // audio class" only has to join (saves several seconds).
+    if ((widget.teacherData['mode'] ?? 'online').toString().toLowerCase() ==
+        'online') {
+      StreamManager.prewarm(
+        userId: (widget.teacherData['_id'] ?? widget.teacherData['id'] ?? '')
+            .toString(),
+        userName: widget.teacherData['name']?.toString() ?? 'Teacher',
+      );
+    }
 
     _pollingTimer = Timer.periodic(const Duration(seconds: 10), (_) {
       fetchAssignedStudentsSilent();
@@ -610,9 +1208,15 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
           (widget.teacherData['_id'] ?? widget.teacherData['id'] ?? '')
               .toString();
 
-      _ioSocket = IO.io(ApiEndpoints.baseUrl, <String, dynamic>{
+      // Socket.IO must connect to the server root, NOT ".../api"
+      // (the path would be treated as a namespace and never receive events).
+      final uri = Uri.parse(ApiEndpoints.baseUrl);
+      final host = "${uri.scheme}://${uri.host}:${uri.port}";
+
+      _ioSocket = IO.io(host, <String, dynamic>{
         'transports': ['websocket'],
         'autoConnect': true,
+        'auth': {'token': ApiHeaders.token ?? ''},
       });
 
       _ioSocket?.onConnect((_) {
@@ -666,8 +1270,9 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
 
       final response = await http.get(
         Uri.parse(
-          "${ApiEndpoints.baseUrl}/admin/trainer-roster?stage=$stage&language=$language&section=$querySection&mode=$teacherMode",
+          "${ApiEndpoints.trainerRoster}?stage=$stage&language=$language&section=$querySection&mode=$teacherMode",
         ),
+        headers: ApiHeaders.auth(),
       );
 
       if (response.statusCode == 200) {
@@ -682,6 +1287,10 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
             }).toList();
           });
         }
+      } else if (response.statusCode == 401) {
+        debugPrint("Roster 401: session expired, please log in again.");
+      } else {
+        debugPrint("Roster failed: ${response.statusCode} ${response.body}");
       }
     } catch (e) {
       debugPrint("Fetch Error: $e");
@@ -739,8 +1348,8 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
           (widget.teacherData['_id'] ?? widget.teacherData['id'] ?? '')
               .toString();
       final res = await http.post(
-        Uri.parse("${ApiEndpoints.baseUrl}/user/mark-attendance"),
-        headers: {"Content-Type": "application/json"},
+        Uri.parse(ApiEndpoints.markAttendance),
+        headers: ApiHeaders.json(),
         body: jsonEncode({
           "userId": teacherId,
           "stage":
@@ -781,6 +1390,7 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
   }
 
   Future<void> _startTeacherAudioBroadcast() async {
+    if (isStartingBroadcast) return;
     setState(() => isStartingBroadcast = true);
     final String language =
         widget.teacherData['language']?.toString() ?? "English";
@@ -806,65 +1416,70 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
         widget.teacherData['name']?.toString() ?? 'Teacher';
 
     try {
-      await http.post(
-        Uri.parse("${ApiEndpoints.baseUrl}/user/join-online-class"),
-        headers: {"Content-Type": "application/json"},
-        body: jsonEncode({
-          "userId": teacherId,
-          "language": language,
-          "stage": stage,
-        }),
-      );
+      // In parallel: Stream client (usually already ready) + server creates today's class
+      final results = await Future.wait<Object>([
+        StreamManager.clientFor(userId: teacherId, userName: teacherName),
+        _prepareCallOnServer(language, stage, section),
+      ]);
+      final client = results[0] as StreamVideo;
+      final callId = results[1] as String;
 
-      final tokenRes = await http.post(
-        Uri.parse("${ApiEndpoints.baseUrl}/stream/token"),
-        headers: {"Content-Type": "application/json"},
-        body: jsonEncode({
-          "userId": teacherId,
-          "name": teacherName,
-          "role": "admin",
-        }),
-      );
-
-      if (tokenRes.statusCode != 200)
-        throw Exception("Failed to authorize stream");
-      final tokenData = jsonDecode(tokenRes.body);
-      final token = tokenData['token']?.toString() ?? '';
-
-      final client = await StreamManager.getClient(
-        userId: teacherId,
-        userName: teacherName,
-        token: token,
-      );
-
-      final callId = language.toLowerCase() == "english"
-          ? "${language.toLowerCase()}_${stage}_sec${section}_class"
-          : "${language.toLowerCase()}_${stage}_class";
-
-      final call = client.makeCall(
+      // ⚡ Fast path: one join() call (creates the call + mic on)
+      var call = client.makeCall(
         callType: StreamCallType.defaultType(),
         id: callId,
       );
-      await call.getOrCreate();
-      await call.join();
+      var joined = await call.join(
+        connectOptions: CallConnectOptions(microphone: TrackOption.enabled()),
+      );
 
-      try {
-        await call.setMicrophoneEnabled(enabled: true);
-      } catch (micErr) {
-        debugPrint("Mic Error: $micErr");
+      if (joined.isFailure) {
+        debugPrint("Fast join failed: $joined");
+        // 🛟 Safe path (the old, proven way): fresh connection → getOrCreate → join → mic
+        try {
+          await call.leave();
+        } catch (_) {}
+        await StreamManager.reset();
+        final fresh = await StreamManager.clientFor(
+          userId: teacherId,
+          userName: teacherName,
+        );
+        call = fresh.makeCall(
+          callType: StreamCallType.defaultType(),
+          id: callId,
+        );
+        joined = await call.join();
+        if (joined.isFailure) {
+          debugPrint("Safe join failed: $joined");
+          final reason = "${call.state.value.status}";
+          throw Exception(
+            "Could not connect to the classroom.\n${reason.length > 300 ? reason.substring(0, 300) : reason}",
+          );
+        }
+        try {
+          await call.setMicrophoneEnabled(enabled: true);
+        } catch (e) {
+          debugPrint("Mic Error: $e");
+        }
       }
 
-      await http.post(
-        Uri.parse(ApiEndpoints.updateLiveLink),
-        headers: {"Content-Type": "application/json"},
-        body: jsonEncode({
-          "language": language,
-          "stage": stage,
-          "section": section,
-          "type": "class",
-          "link": "stream_active_$callId",
-        }),
+      ClassroomController.instance.begin(
+        call: call,
+        language: language,
+        stage: stage,
+        section: section == 'none' ? '' : section.toUpperCase(),
+        teacherId: teacherId,
       );
+
+      // The trainer is live now — everything below runs in the background.
+      unawaited(
+        TrainerOnlineSession.start(
+          teacherId: teacherId,
+          language: language,
+          stage: stage,
+        ),
+      );
+      unawaited(_publishLiveLink(callId, language, stage, section));
 
       GlobalAudioOverlayController.removeOverlay();
 
@@ -876,18 +1491,89 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
           section: section,
           enrolledStudents: allAssignedStudents,
           teacherData: widget.teacherData,
-          onCallEnded: () => setState(() {}),
+          onCallEnded: () {
+            if (mounted) setState(() {});
+          },
         ),
       );
     } catch (e) {
       Get.snackbar(
         "Broadcast Error",
-        "Could not start broadcast: $e",
+        e.toString().replaceFirst('Exception: ', ''),
         backgroundColor: accentRed,
         colorText: Colors.white,
+        duration: const Duration(seconds: 6),
       );
     } finally {
       if (mounted) setState(() => isStartingBroadcast = false);
+    }
+  }
+
+  /// The server creates the call (one per class per day) and returns its id.
+  /// Any Stream problem comes back as a readable message.
+  Future<String> _prepareCallOnServer(
+    String language,
+    String stage,
+    String section,
+  ) async {
+    final teacherId =
+        (widget.teacherData['_id'] ?? widget.teacherData['id'] ?? '').toString();
+    final res = await http
+        .post(
+          Uri.parse(ApiEndpoints.prepareCall),
+          headers: ApiHeaders.json(),
+          body: jsonEncode({
+            "userId": teacherId,
+            "language": language,
+            "stage": stage,
+            "section": section,
+            "type": "class",
+          }),
+        )
+        .timeout(const Duration(seconds: 25));
+    final data = jsonDecode(res.body);
+    if (res.statusCode == 200 && (data['callId'] ?? '').toString().isNotEmpty) {
+      return data['callId'].toString();
+    }
+    if (res.statusCode == 401) {
+      throw Exception("Session expired. Please log out and log in again.");
+    }
+    throw Exception(
+      "Server could not create the class: ${data['error'] ?? res.statusCode}",
+    );
+  }
+
+  Future<void> _publishLiveLink(
+    String callId,
+    String language,
+    String stage,
+    String section,
+  ) async {
+    try {
+      final linkRes = await http.post(
+        Uri.parse(ApiEndpoints.updateLiveLink),
+        headers: ApiHeaders.json(),
+        body: jsonEncode({
+          "language": language,
+          "stage": stage,
+          "section": section,
+          "type": "class",
+          "link": "stream_active_$callId",
+        }),
+      );
+      if (linkRes.statusCode != 200 && linkRes.statusCode != 201) {
+        debugPrint(
+          "Live link update failed: ${linkRes.statusCode} ${linkRes.body}",
+        );
+        Get.snackbar(
+          "Notice",
+          "Class started, but students may not see it yet (live link not saved).",
+          backgroundColor: goldenYellow,
+          colorText: Colors.black,
+        );
+      }
+    } catch (e) {
+      debugPrint("Live link error: $e");
     }
   }
 
@@ -960,6 +1646,20 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
           )
           .toList();
     }
+
+    // ⏰ Batch timing filter
+    if (activeBatch != 'all') {
+      filteredStudents = filteredStudents
+          .where((s) => BatchSlots.labelOf(s['batchTime']) == (activeBatch == 'none' ? '' : activeBatch))
+          .toList();
+    }
+    // Sort by batch (earliest first), students without a timing last
+    filteredStudents.sort((a, b) {
+      final ba = BatchSlots.find(a['batchTime'])?.number ?? 99;
+      final bb = BatchSlots.find(b['batchTime'])?.number ?? 99;
+      if (ba != bb) return ba.compareTo(bb);
+      return (a['name'] ?? '').toString().compareTo((b['name'] ?? '').toString());
+    });
 
     return Scaffold(
       backgroundColor: backgroundColor,
@@ -1035,6 +1735,8 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
                         presentCount,
                         absentCount,
                       ),
+                      const SizedBox(height: 10),
+                      _buildBatchBar(),
                       const SizedBox(height: 16),
                       if (filteredStudents.isEmpty)
                         _buildEmptyRoster()
@@ -1051,6 +1753,23 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
         ),
       ),
     );
+  }
+
+  Future<void> _logout() async {
+    await ClassroomController.instance.finish();
+    try {
+      final activeCall = GlobalAudioOverlayController.currentCall;
+      if (activeCall != null) await activeCall.leave();
+    } catch (_) {}
+    await TrainerOnlineSession.leave();
+    GlobalAudioOverlayController.removeOverlay();
+    await StreamManager.reset();
+
+    final box = GetStorage();
+    await box.remove('teacher_profile');
+    await box.remove('token');
+
+    Get.offAll(() => const TeacherLoginScreen());
   }
 
   PreferredSizeWidget _buildPortalAppBar(
@@ -1121,7 +1840,7 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
         const SizedBox(width: 2),
         IconButton(
           tooltip: 'Logout',
-          onPressed: () => Get.offAll(() => const TeacherLoginScreen()),
+          onPressed: _logout,
           icon: const Icon(Icons.logout_rounded),
           color: const Color(0xffC94B4B),
         ),
@@ -1578,6 +2297,84 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
     );
   }
 
+  Widget _buildBatchBar() {
+    int countFor(String key) {
+      if (key == 'all') return allAssignedStudents.length;
+      final want = key == 'none' ? '' : key;
+      return allAssignedStudents.where((s) => BatchSlots.labelOf(s['batchTime']) == want).length;
+    }
+
+    final items = <(String, String)>[
+      ('all', 'All timings'),
+      ...BatchSlots.all.map((b) => (b.label, b.shortLabel)),
+      ('none', 'No timing'),
+    ];
+
+    return SizedBox(
+      height: 40,
+      child: ListView.separated(
+        scrollDirection: Axis.horizontal,
+        itemCount: items.length,
+        separatorBuilder: (_, __) => const SizedBox(width: 7),
+        itemBuilder: (context, index) {
+          final key = items[index].$1;
+          final label = items[index].$2;
+          final count = countFor(key);
+          final selected = activeBatch == key;
+          if (key == 'none' && count == 0 && !selected) return const SizedBox.shrink();
+
+          return InkWell(
+            borderRadius: BorderRadius.circular(11),
+            onTap: () => setState(() => activeBatch = key),
+            child: AnimatedContainer(
+              duration: const Duration(milliseconds: 160),
+              padding: const EdgeInsets.symmetric(horizontal: 11),
+              decoration: BoxDecoration(
+                color: selected ? brandBlue : Colors.white,
+                borderRadius: BorderRadius.circular(11),
+                border: Border.all(color: selected ? brandBlue : const Color(0xffDCE7F0)),
+              ),
+              child: Row(
+                children: [
+                  Icon(
+                    key == 'all' ? Icons.schedule_rounded : Icons.access_time_filled_rounded,
+                    size: 13,
+                    color: selected ? Colors.white : brandBlue,
+                  ),
+                  const SizedBox(width: 5),
+                  Text(
+                    label,
+                    style: GoogleFonts.poppins(
+                      color: selected ? Colors.white : const Color(0xff4F6680),
+                      fontSize: 10.5,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                    decoration: BoxDecoration(
+                      color: selected ? Colors.white.withOpacity(.18) : brandBlue.withOpacity(.09),
+                      borderRadius: BorderRadius.circular(6),
+                    ),
+                    child: Text(
+                      '$count',
+                      style: GoogleFonts.poppins(
+                        color: selected ? Colors.white : brandBlue,
+                        fontSize: 9,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
   Widget _buildDesktopRoster(List<dynamic> students) {
     return Container(
       width: double.infinity,
@@ -1610,6 +2407,7 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
               headingRowColor: const WidgetStatePropertyAll(Color(0xffF9FAFB)),
               columns: const [
                 DataColumn(label: Text('STUDENT')),
+                DataColumn(label: Text('TIMING')),
                 DataColumn(label: Text('ATTENDANCE')),
                 DataColumn(label: Text('PAYMENT')),
               ],
@@ -1648,6 +2446,12 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
                             ),
                           ),
                         ],
+                      ),
+                    ),
+                    DataCell(
+                      _statusBadge(
+                        BatchSlots.shortOf(student['batchTime'], fallback: 'No timing'),
+                        brandBlue,
                       ),
                     ),
                     DataCell(
@@ -1719,6 +2523,10 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
                       spacing: 6,
                       runSpacing: 5,
                       children: [
+                        _statusBadge(
+                          BatchSlots.shortOf(student['batchTime'], fallback: 'No timing'),
+                          brandBlue,
+                        ),
                         _statusBadge(
                           present ? 'Present' : 'Absent',
                           present ? accentGreen : accentRed,
@@ -1844,6 +2652,13 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
   }
 }
 
+// =========================================================================
+// 🎙️ TRAINER LIVE CLASSROOM
+// Two tabs instead of one long list:
+//   • Practice  → who is speaking now, "Mark practiced", who is next, who is done
+//   • Students  → compact grid (30 students fit on ~1.5 screens) + search/filters
+// Bottom bar: Mute me • Mute all / Unlock all • Practice • Minimize • End
+// =========================================================================
 class TeacherBroadcastScreen extends StatefulWidget {
   final Call call;
   final String language;
@@ -1869,138 +2684,2566 @@ class TeacherBroadcastScreen extends StatefulWidget {
 }
 
 class _TeacherBroadcastScreenState extends State<TeacherBroadcastScreen> {
-  bool isTeacherMuted = false;
+  final ClassroomController cc = ClassroomController.instance;
+  final TextEditingController _searchCtrl = TextEditingController();
+
+  int tab = 0; // 0 = Practice, 1 = Students
+  String search = '';
+  String studentFilter = 'all'; // all | speaking | mic | practiced | pending
+  bool _leaving = false;
 
   static const Color navy = Color(0xFF155A88);
   static const Color deepNavy = Color(0xFF0E466D);
   static const Color blue = Color(0xFF2C6F9F);
   static const Color teal = Color(0xFF28C2C2);
   static const Color yellow = Color(0xFFF7DF55);
+  static const Color amber = Color(0xFFC78B00);
   static const Color periwinkle = Color(0xFF7CA4D8);
   static const Color background = Color(0xFFE8F2F8);
-  static const Color backgroundDark = Color(0xFFD9EAF3);
+  static const Color border = Color(0xFFD7E5EE);
   static const Color green = Color(0xFF20A879);
   static const Color red = Color(0xFFE45757);
+  static const Color textDark = Color(0xFF123B57);
   static const Color textSecondary = Color(0xFF6B8193);
+
+  static const List<Color> _avatarColors = [
+    Color(0xFF155A88),
+    Color(0xFF7A5AF8),
+    Color(0xFF0E9384),
+    Color(0xFFDD6B20),
+    Color(0xFFC11574),
+    Color(0xFF2C6F9F),
+    Color(0xFF4E5BA6),
+    Color(0xFF16A34A),
+  ];
+
+  String get teacherId =>
+      (widget.teacherData['_id'] ?? widget.teacherData['id'] ?? '').toString();
 
   @override
   void initState() {
     super.initState();
     GlobalAudioOverlayController.removeOverlay();
+    // Safety: screen opened for a call the controller doesn't know yet
+    if (cc.call != widget.call) {
+      cc.begin(
+        call: widget.call,
+        language: widget.language,
+        stage: widget.stage.toLowerCase(),
+        section: widget.language.toLowerCase() == 'hindi'
+            ? ''
+            : widget.section.toUpperCase(),
+        teacherId: teacherId,
+      );
+    }
   }
 
-  Future<void> _toggleTeacherMic() async {
-    final bool newMuted = !isTeacherMuted;
+  @override
+  void dispose() {
+    _searchCtrl.dispose();
+    super.dispose();
+  }
+
+  // ---------------------------------------------------------------------
+  // Helpers
+  // ---------------------------------------------------------------------
+  String _nameOf(CallParticipantState p) {
+    final n = p.name.trim();
+    return n.isEmpty ? 'Student' : n;
+  }
+
+  String _initial(String name) {
+    final v = name.trim();
+    return v.isEmpty ? '?' : v[0].toUpperCase();
+  }
+
+  Color _colorFor(String name) {
+    int sum = 0;
+    for (final c in name.codeUnits) {
+      sum += c;
+    }
+    return _avatarColors[sum % _avatarColors.length];
+  }
+
+  PracticeEntry _entry(CallParticipantState p) =>
+      PracticeEntry(p.userId, _nameOf(p));
+
+  Map<String, dynamic>? _enrolled(CallParticipantState p) {
+    final name = _nameOf(p).toLowerCase();
+    final match = widget.enrolledStudents.firstWhereOrNull(
+      (s) =>
+          s['_id']?.toString() == p.userId ||
+          s['name']?.toString().toLowerCase().trim() == name,
+    );
+    return match is Map<String, dynamic> ? match : null;
+  }
+
+  bool _isPaid(CallParticipantState p) {
+    final s = _enrolled(p);
+    if (s == null) return true; // unknown → don't flag
+    return (s['feeStatus'] ?? 'unpaid').toString().toLowerCase() == 'paid';
+  }
+
+  List<CallParticipantState> _dedupe(List<CallParticipantState> raw) {
+    final seen = <String>{};
+    return raw.where((p) => seen.add(p.userId)).toList();
+  }
+
+  void _toast(String message, {Color color = deepNavy, IconData? icon}) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          behavior: SnackBarBehavior.floating,
+          backgroundColor: color,
+          duration: const Duration(milliseconds: 2200),
+          margin: const EdgeInsets.fromLTRB(16, 0, 16, 96),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+          content: Row(
+            children: [
+              if (icon != null) ...[
+                Icon(icon, color: Colors.white, size: 18),
+                const SizedBox(width: 10),
+              ],
+              Expanded(
+                child: Text(
+                  message,
+                  style: GoogleFonts.poppins(
+                    color: Colors.white,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+  }
+
+  void _minimize() {
+    Get.until((route) => route.isFirst);
+    GlobalAudioOverlayController.showOverlay(
+      context,
+      widget.call,
+      teacherId,
+      "Live Studio",
+      widget.teacherData,
+      widget.enrolledStudents,
+    );
+  }
+
+  // ---------------------------------------------------------------------
+  // Actions
+  // ---------------------------------------------------------------------
+  Future<void> _toggleTeacherMic(bool currentlyOn) async {
     try {
-      await widget.call.setMicrophoneEnabled(enabled: !newMuted);
-      if (mounted) {
-        setState(() => isTeacherMuted = newMuted);
-      }
+      await widget.call.setMicrophoneEnabled(enabled: !currentlyOn);
     } catch (e) {
       debugPrint("Teacher Mic Error: $e");
     }
   }
 
-  /// 🚀 Mute all connected non-admin participants using SDK's `muteUsers`
-  Future<void> _muteAllStudents() async {
-    try {
-      final participants = widget.call.state.value.callParticipants;
-      final studentIds = participants
-          .where((p) => !p.roles.contains('admin'))
-          .map((p) => p.userId)
-          .toList();
-
-      if (studentIds.isNotEmpty) {
-        await widget.call.muteUsers(userIds: studentIds);
-        Get.snackbar(
-          "Muted All",
-          "All connected students have been muted.",
-          backgroundColor: teal,
-          colorText: Colors.white,
-        );
-      }
-    } catch (e) {
-      debugPrint("Mute All Error: $e");
-    }
+  Future<void> _toggleLock() async {
+    final lock = !cc.micLocked.value;
+    HapticFeedback.mediumImpact();
+    await cc.setMicLock(lock);
+    _toast(
+      lock
+          ? 'All students muted. They can speak only when you allow them.'
+          : 'Mics unlocked. Students can unmute themselves now.',
+      color: lock ? amber : green,
+      icon: lock ? Icons.lock_rounded : Icons.lock_open_rounded,
+    );
   }
 
-  /// 🚀 Leave Class: Teacher leaves, students stay
+  Future<void> _markPracticed() async {
+    final name = cc.current.value?.name ?? '';
+    HapticFeedback.mediumImpact();
+    final ok = await cc.markCurrentPracticed();
+    if (!ok) {
+      _toast(
+        'Could not save. Check the internet and tap again.',
+        color: red,
+        icon: Icons.wifi_off_rounded,
+      );
+      return;
+    }
+    final next = cc.current.value;
+    _toast(
+      next != null ? '$name practiced ✓  Now: ${next.name}' : '$name practiced ✓',
+      color: green,
+      icon: Icons.check_circle_rounded,
+    );
+  }
+
   Future<void> _leaveClassOnly() async {
+    if (_leaving) return;
+    _leaving = true;
+    await cc.finish(); // opens mics so students aren't stuck muted
     try {
       await widget.call.leave();
-      GlobalAudioOverlayController.removeOverlay();
-      if (widget.onCallEnded != null) widget.onCallEnded!();
-      Get.back();
-      Get.snackbar(
-        "Left Classroom",
-        "You have left the classroom session.",
-        backgroundColor: navy,
-        colorText: Colors.white,
-      );
-    } catch (e) {
-      GlobalAudioOverlayController.removeOverlay();
-      Get.back();
-    }
+    } catch (_) {}
+    await TrainerOnlineSession.leave();
+    GlobalAudioOverlayController.removeOverlay();
+    widget.onCallEnded?.call();
+    Get.back();
+    Get.snackbar(
+      "Left Classroom",
+      "You left. Students can stay in the room.",
+      backgroundColor: navy,
+      colorText: Colors.white,
+    );
   }
 
-  /// 🚀 End Class: Completely ends the session for everyone and deletes the backend link
-  Future<void> _endClassAndBroadcast(BuildContext context) async {
+  Future<void> _endClassAndBroadcast() async {
+    if (_leaving) return;
+    _leaving = true;
+    final c = widget.call;
+    final studentIds = c.state.value.callParticipants
+        .where((p) => !cc.isStaff(p))
+        .map((p) => p.userId)
+        .toSet();
+
+    await cc.finish();
+    // Remove everyone in parallel (30 students = one round-trip, not 30)
+    await Future.wait(
+      studentIds.map((id) => c.kickUser(id).then((_) {}, onError: (_) {})),
+    );
     try {
-      final participants = widget.call.state.value.callParticipants;
-      for (var p in participants) {
-        if (!p.roles.contains('admin')) {
-          try {
-            await widget.call.kickUser(p.userId);
-          } catch (_) {}
-        }
-      }
+      await c.leave();
+    } catch (_) {}
+    await TrainerOnlineSession.leave();
+    unawaited(_deleteLiveLink());
 
-      await widget.call.leave();
+    GlobalAudioOverlayController.removeOverlay();
+    widget.onCallEnded?.call();
+    Get.until((route) => route.isFirst);
+    Get.snackbar(
+      "Class Ended",
+      "The live classroom has been closed for everyone.",
+      backgroundColor: red,
+      colorText: Colors.white,
+    );
+  }
 
-      final request = http.Request(
-        "DELETE",
-        Uri.parse(ApiEndpoints.deleteLiveLink),
-      );
-      request.headers.addAll({"Content-Type": "application/json"});
+  Future<void> _deleteLiveLink() async {
+    try {
+      final request = http.Request("DELETE", Uri.parse(ApiEndpoints.deleteLiveLink));
+      request.headers.addAll(ApiHeaders.json());
       request.body = jsonEncode({
         "language": widget.language,
         "stage": widget.stage.toLowerCase(),
         "section": widget.section.toLowerCase(),
         "type": "class",
       });
-
-      final streamedResponse = await request.send();
-      await http.Response.fromStream(streamedResponse);
-
-      GlobalAudioOverlayController.removeOverlay();
-      if (widget.onCallEnded != null) widget.onCallEnded!();
-
-      Get.until((route) => route.isFirst);
-      Get.snackbar(
-        "Class Ended",
-        "The live classroom has been closed completely.",
-        backgroundColor: red,
-        colorText: Colors.white,
-      );
+      final streamed = await request.send();
+      await http.Response.fromStream(streamed);
     } catch (e) {
-      GlobalAudioOverlayController.removeOverlay();
-      if (widget.onCallEnded != null) widget.onCallEnded!();
-      Get.until((route) => route.isFirst);
+      debugPrint("Delete live link error: $e");
     }
   }
 
-  Future<void> _kickParticipant(dynamic participant) async {
-    final String participantId = participant.userId;
-    final String participantName = participant.name.toString().trim().isEmpty
-        ? 'Student'
-        : participant.name.toString();
+  // ---------------------------------------------------------------------
+  // BUILD
+  // ---------------------------------------------------------------------
+  @override
+  Widget build(BuildContext context) {
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, result) {
+        if (didPop) return;
+        _minimize();
+      },
+      child: Scaffold(
+        backgroundColor: background,
+        appBar: _buildAppBar(),
+        body: StreamBuilder<CallState>(
+          stream: widget.call.state.asStream(),
+          initialData: widget.call.state.value,
+          builder: (context, snapshot) {
+            final state = snapshot.data ?? widget.call.state.value;
+            final participants = _dedupe(state.callParticipants);
+            final students = participants.where((p) => !cc.isStaff(p)).toList();
+            final me =
+                participants.firstWhereOrNull((p) => p.userId == teacherId) ??
+                participants.firstWhereOrNull((p) => p.isLocal);
+            final speaker = participants.firstWhereOrNull((p) => p.isSpeaking);
 
+            return SafeArea(
+              top: false,
+              child: Center(
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 920),
+                  child: Column(
+                    children: [
+                      _liveStrip(students.length, speaker),
+                      Obx(() => _micLockBar()),
+                      _tabBar(students.length),
+                      Expanded(
+                        child: AnimatedSwitcher(
+                          duration: const Duration(milliseconds: 180),
+                          child: tab == 0
+                              ? KeyedSubtree(
+                                  key: const ValueKey('practice'),
+                                  child: _practiceTab(students),
+                                )
+                              : KeyedSubtree(
+                                  key: const ValueKey('students'),
+                                  child: _studentsTab(students),
+                                ),
+                        ),
+                      ),
+                      _controlBar(me, students),
+                    ],
+                  ),
+                ),
+              ),
+            );
+          },
+        ),
+      ),
+    );
+  }
+
+  PreferredSizeWidget _buildAppBar() {
+    final bool english = widget.language.toLowerCase() == 'english';
+    return AppBar(
+      elevation: 0,
+      scrolledUnderElevation: 0,
+      backgroundColor: navy,
+      foregroundColor: Colors.white,
+      automaticallyImplyLeading: false,
+      toolbarHeight: 62,
+      leading: IconButton(
+        tooltip: 'Minimize (class keeps running)',
+        onPressed: _minimize,
+        icon: const Icon(Icons.keyboard_arrow_down_rounded, size: 28),
+      ),
+      titleSpacing: 0,
+      title: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            'Live Classroom',
+            style: GoogleFonts.poppins(
+              color: Colors.white,
+              fontSize: 15,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          Text(
+            '${widget.language} • ${widget.stage.toUpperCase()}${english ? ' • Section ${widget.section.toUpperCase()}' : ''}',
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: GoogleFonts.poppins(
+              color: Colors.white.withOpacity(.70),
+              fontSize: 10,
+              fontWeight: FontWeight.w500,
+            ),
+          ),
+        ],
+      ),
+      actions: [
+        Obx(() {
+          final n = cc.otherBatch.length;
+          return IconButton(
+            tooltip: 'Joined from another batch',
+            onPressed: _openOtherBatchSheet,
+            icon: Stack(
+              clipBehavior: Clip.none,
+              children: [
+                const Icon(Icons.swap_horiz_rounded, size: 23),
+                if (n > 0)
+                  Positioned(
+                    right: -6,
+                    top: -5,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                      decoration: BoxDecoration(
+                        color: yellow,
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: Text(
+                        '$n',
+                        style: GoogleFonts.poppins(
+                          color: deepNavy,
+                          fontSize: 9,
+                          fontWeight: FontWeight.w800,
+                        ),
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          );
+        }),
+        IconButton(
+          tooltip: 'Refresh',
+          onPressed: () {
+            cc.loadPracticedToday();
+            cc.loadOtherBatch();
+          },
+          icon: const Icon(Icons.sync_rounded, size: 21),
+        ),
+        const SizedBox(width: 4),
+      ],
+    );
+  }
+
+  // ---------------------------------------------------------------------
+  // Top: live strip + mic lock
+  // ---------------------------------------------------------------------
+  Widget _liveStrip(int joined, CallParticipantState? speaker) {
+    final int enrolled = widget.enrolledStudents.length;
+    return Container(
+      margin: const EdgeInsets.fromLTRB(14, 12, 14, 0),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: border),
+      ),
+      child: Row(
+        children: [
+          const _LiveDot(),
+          const SizedBox(width: 6),
+          Text(
+            'LIVE',
+            style: GoogleFonts.poppins(
+              color: red,
+              fontSize: 10.5,
+              fontWeight: FontWeight.w800,
+              letterSpacing: .5,
+            ),
+          ),
+          const SizedBox(width: 6),
+          _Elapsed(
+            since: cc.startedAt,
+            style: GoogleFonts.poppins(
+              color: textDark,
+              fontSize: 11,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          Container(
+            width: 1,
+            height: 18,
+            margin: const EdgeInsets.symmetric(horizontal: 10),
+            color: border,
+          ),
+          const Icon(Icons.people_alt_rounded, size: 15, color: navy),
+          const SizedBox(width: 5),
+          Text(
+            enrolled > 0 ? '$joined/$enrolled' : '$joined',
+            style: GoogleFonts.poppins(
+              color: textDark,
+              fontSize: 11,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Align(
+              alignment: Alignment.centerRight,
+              child: speaker == null
+                  ? Text(
+                      'Quiet',
+                      style: GoogleFonts.poppins(
+                        color: textSecondary,
+                        fontSize: 10.5,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    )
+                  : Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 9,
+                        vertical: 4,
+                      ),
+                      decoration: BoxDecoration(
+                        color: teal.withOpacity(.12),
+                        borderRadius: BorderRadius.circular(20),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const Icon(Icons.graphic_eq_rounded, size: 13, color: teal),
+                          const SizedBox(width: 4),
+                          Flexible(
+                            child: Text(
+                              speaker.userId == teacherId ? 'You' : _nameOf(speaker),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: GoogleFonts.poppins(
+                                color: deepNavy,
+                                fontSize: 10.5,
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _micLockBar() {
+    final bool locked = cc.micLocked.value;
+    final int allowedCount = cc.allowed.length;
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 200),
+      margin: const EdgeInsets.fromLTRB(14, 10, 14, 0),
+      padding: const EdgeInsets.fromLTRB(12, 10, 10, 10),
+      decoration: BoxDecoration(
+        color: locked ? const Color(0xFFFFF7DD) : Colors.white,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(
+          color: locked ? const Color(0xFFF1D57A) : border,
+        ),
+      ),
+      child: Row(
+        children: [
+          Container(
+            width: 38,
+            height: 38,
+            decoration: BoxDecoration(
+              color: locked ? amber.withOpacity(.15) : teal.withOpacity(.12),
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: Icon(
+              locked ? Icons.lock_rounded : Icons.mic_rounded,
+              color: locked ? amber : teal,
+              size: 19,
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  locked ? 'Student mics locked' : 'Student mics open',
+                  style: GoogleFonts.poppins(
+                    color: textDark,
+                    fontSize: 12.5,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                Text(
+                  locked
+                      ? (allowedCount > 0
+                          ? '$allowedCount allowed to speak • others can’t unmute'
+                          : 'Nobody can unmute until you allow them')
+                      : 'Students can unmute themselves',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: GoogleFonts.poppins(
+                    color: textSecondary,
+                    fontSize: 10,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 8),
+          ElevatedButton.icon(
+            onPressed: _toggleLock,
+            icon: Icon(
+              locked ? Icons.lock_open_rounded : Icons.mic_off_rounded,
+              size: 16,
+            ),
+            label: Text(
+              locked ? 'Unlock all' : 'Mute all',
+              style: GoogleFonts.poppins(
+                fontSize: 11,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: locked ? green : deepNavy,
+              foregroundColor: Colors.white,
+              elevation: 0,
+              padding: const EdgeInsets.symmetric(horizontal: 12),
+              minimumSize: const Size(0, 38),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(11),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _tabBar(int studentCount) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(14, 12, 14, 8),
+      child: Container(
+        padding: const EdgeInsets.all(4),
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(color: border),
+        ),
+        child: Row(
+          children: [
+            Expanded(
+              child: _tab(
+                0,
+                Icons.record_voice_over_rounded,
+                'Practice',
+                Obx(() {
+                  final total = cc.practiceTotal;
+                  return _tabCount(
+                    total == 0 ? '' : '${cc.done.length}/$total',
+                    tab == 0,
+                  );
+                }),
+              ),
+            ),
+            const SizedBox(width: 4),
+            Expanded(
+              child: _tab(
+                1,
+                Icons.groups_rounded,
+                'Students',
+                _tabCount('$studentCount', tab == 1),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _tab(int index, IconData icon, String label, Widget badge) {
+    final bool selected = tab == index;
+    return InkWell(
+      borderRadius: BorderRadius.circular(11),
+      onTap: () => setState(() => tab = index),
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 180),
+        height: 40,
+        decoration: BoxDecoration(
+          color: selected ? navy : Colors.transparent,
+          borderRadius: BorderRadius.circular(11),
+        ),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(icon, size: 16, color: selected ? Colors.white : textSecondary),
+            const SizedBox(width: 6),
+            Text(
+              label,
+              style: GoogleFonts.poppins(
+                color: selected ? Colors.white : textDark,
+                fontSize: 12,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+            const SizedBox(width: 6),
+            badge,
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _tabCount(String text, bool selected) {
+    if (text.isEmpty) return const SizedBox.shrink();
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+      decoration: BoxDecoration(
+        color: selected ? Colors.white.withOpacity(.2) : navy.withOpacity(.08),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Text(
+        text,
+        style: GoogleFonts.poppins(
+          color: selected ? Colors.white : navy,
+          fontSize: 10,
+          fontWeight: FontWeight.w800,
+        ),
+      ),
+    );
+  }
+
+  // ---------------------------------------------------------------------
+  // PRACTICE TAB
+  // ---------------------------------------------------------------------
+  Widget _practiceTab(List<CallParticipantState> students) {
+    return Obx(() {
+      final PracticeEntry? cur = cc.current.value;
+      final List<PracticeEntry> queue = cc.queue.toList();
+      final List<PracticeEntry> done = cc.done.toList();
+      final bool saving = cc.saving.value;
+      final int practicedToday = cc.practicedToday.length;
+      final bool locked = cc.micLocked.value;
+
+      if (cur == null && queue.isEmpty && done.isEmpty) {
+        return _practiceEmpty(students, practicedToday);
+      }
+
+      final byId = {for (final p in students) p.userId: p};
+      final int total = done.length + queue.length + (cur == null ? 0 : 1);
+
+      return ListView(
+        physics: const BouncingScrollPhysics(),
+        padding: const EdgeInsets.fromLTRB(14, 2, 14, 16),
+        children: [
+          _progressCard(done.length, total, students),
+          const SizedBox(height: 12),
+          if (cur != null)
+            _currentCard(cur, byId[cur.id], saving, locked)
+          else
+            _roundDoneCard(done.length, students),
+          if (queue.isNotEmpty) ...[
+            const SizedBox(height: 18),
+            _sectionTitle('Up next', queue.length, Icons.queue_music_rounded),
+            const SizedBox(height: 8),
+            for (int i = 0; i < queue.length; i++)
+              _queueRow(i, queue[i], byId[queue[i].id]),
+          ],
+          if (done.isNotEmpty) ...[
+            const SizedBox(height: 14),
+            _sectionTitle('Practiced', done.length, Icons.check_circle_rounded),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: done.map(_doneChip).toList(),
+            ),
+          ],
+        ],
+      );
+    });
+  }
+
+  Widget _practiceEmpty(List<CallParticipantState> students, int practicedToday) {
+    final notDone = students
+        .where((p) => !cc.practicedToday.contains(p.userId))
+        .toList();
+
+    return ListView(
+      physics: const BouncingScrollPhysics(),
+      padding: const EdgeInsets.fromLTRB(14, 2, 14, 16),
+      children: [
+        Container(
+          padding: const EdgeInsets.fromLTRB(20, 24, 20, 20),
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(22),
+            border: Border.all(color: border),
+          ),
+          child: Column(
+            children: [
+              Container(
+                width: 70,
+                height: 70,
+                decoration: BoxDecoration(
+                  color: teal.withOpacity(.12),
+                  shape: BoxShape.circle,
+                ),
+                child: const Icon(
+                  Icons.record_voice_over_rounded,
+                  color: teal,
+                  size: 32,
+                ),
+              ),
+              const SizedBox(height: 14),
+              Text(
+                'Speaking practice',
+                style: GoogleFonts.poppins(
+                  color: textDark,
+                  fontSize: 17,
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+              const SizedBox(height: 6),
+              Text(
+                'Pick students and call them one by one. When a student finishes, tap “Mark practiced” and the next one is called automatically.',
+                textAlign: TextAlign.center,
+                style: GoogleFonts.poppins(
+                  color: textSecondary,
+                  fontSize: 11.5,
+                  height: 1.5,
+                ),
+              ),
+              const SizedBox(height: 16),
+              Row(
+                children: [
+                  _step('1', 'Pick'),
+                  _stepLine(),
+                  _step('2', 'Listen'),
+                  _stepLine(),
+                  _step('3', 'Mark'),
+                ],
+              ),
+              const SizedBox(height: 18),
+              SizedBox(
+                width: double.infinity,
+                height: 48,
+                child: ElevatedButton.icon(
+                  onPressed: students.isEmpty ? null : () => _openPicker(students),
+                  icon: const Icon(Icons.playlist_add_rounded, size: 20),
+                  label: Text(
+                    students.isEmpty ? 'Waiting for students…' : 'Pick students',
+                    style: GoogleFonts.poppins(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: teal,
+                    foregroundColor: Colors.white,
+                    disabledBackgroundColor: teal.withOpacity(.35),
+                    disabledForegroundColor: Colors.white,
+                    elevation: 0,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(14),
+                    ),
+                  ),
+                ),
+              ),
+              if (notDone.isNotEmpty) ...[
+                const SizedBox(height: 6),
+                TextButton.icon(
+                  onPressed: () {
+                    cc.addToQueue(notDone.map(_entry).toList());
+                    _toast('${notDone.length} students added to the practice line');
+                  },
+                  icon: const Icon(Icons.group_add_rounded, size: 18, color: navy),
+                  label: Text(
+                    'Add all ${notDone.length} not practiced today',
+                    style: GoogleFonts.poppins(
+                      color: navy,
+                      fontSize: 11.5,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ),
+        if (practicedToday > 0)
+          Padding(
+            padding: const EdgeInsets.only(top: 12),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                const Icon(Icons.check_circle_rounded, color: green, size: 15),
+                const SizedBox(width: 6),
+                Text(
+                  '$practicedToday ${practicedToday == 1 ? 'student has' : 'students have'} practiced today',
+                  style: GoogleFonts.poppins(
+                    color: textSecondary,
+                    fontSize: 11,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ],
+            ),
+          ),
+      ],
+    );
+  }
+
+  Widget _step(String n, String label) {
+    return Column(
+      children: [
+        CircleAvatar(
+          radius: 13,
+          backgroundColor: navy.withOpacity(.10),
+          child: Text(
+            n,
+            style: GoogleFonts.poppins(
+              color: navy,
+              fontSize: 11,
+              fontWeight: FontWeight.w800,
+            ),
+          ),
+        ),
+        const SizedBox(height: 4),
+        Text(
+          label,
+          style: GoogleFonts.poppins(
+            color: textDark,
+            fontSize: 10,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _stepLine() => Expanded(
+    child: Container(
+      height: 2,
+      margin: const EdgeInsets.only(bottom: 18, left: 6, right: 6),
+      color: border,
+    ),
+  );
+
+  Widget _progressCard(int doneCount, int total, List<CallParticipantState> students) {
+    final double progress = total == 0 ? 0 : doneCount / total;
+    final int left = total - doneCount;
+    return Container(
+      padding: const EdgeInsets.fromLTRB(14, 10, 8, 14),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: border),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Text(
+                '$doneCount',
+                style: GoogleFonts.poppins(
+                  color: green,
+                  fontSize: 22,
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+              Text(
+                ' of $total done',
+                style: GoogleFonts.poppins(
+                  color: textDark,
+                  fontSize: 12.5,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+              const SizedBox(width: 8),
+              if (left > 0)
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                  decoration: BoxDecoration(
+                    color: yellow.withOpacity(.35),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Text(
+                    '$left left',
+                    style: GoogleFonts.poppins(
+                      color: deepNavy,
+                      fontSize: 10,
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                ),
+              const Spacer(),
+              TextButton.icon(
+                onPressed: () => _openPicker(students),
+                icon: const Icon(Icons.add_rounded, size: 18, color: navy),
+                label: Text(
+                  'Add',
+                  style: GoogleFonts.poppins(
+                    color: navy,
+                    fontSize: 11.5,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+              PopupMenuButton<String>(
+                tooltip: 'More',
+                color: Colors.white,
+                icon: const Icon(Icons.more_vert_rounded, color: textSecondary, size: 20),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                onSelected: (v) {
+                  if (v == 'end') _confirmEndRound();
+                },
+                itemBuilder: (_) => [
+                  PopupMenuItem(
+                    value: 'end',
+                    child: Row(
+                      children: [
+                        const Icon(Icons.stop_circle_outlined, color: red, size: 18),
+                        const SizedBox(width: 10),
+                        Text(
+                          'End practice round',
+                          style: GoogleFonts.poppins(
+                            color: textDark,
+                            fontSize: 12,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Padding(
+            padding: const EdgeInsets.only(right: 6),
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(10),
+              child: LinearProgressIndicator(
+                value: progress,
+                minHeight: 8,
+                backgroundColor: const Color(0xFFE7EEF5),
+                valueColor: const AlwaysStoppedAnimation<Color>(green),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _currentCard(
+    PracticeEntry cur,
+    CallParticipantState? p,
+    bool saving,
+    bool locked,
+  ) {
+    final bool inClass = p != null;
+    final bool speaking = p?.isSpeaking ?? false;
+    final bool micOn = p?.isAudioEnabled ?? false;
+    final String status = !inClass
+        ? 'Left the class — tap Skip'
+        : speaking
+        ? 'Speaking…'
+        : micOn
+        ? 'Mic on'
+        : locked
+        ? 'Allowed to speak — waiting for them to unmute'
+        : 'Muted — ask them to unmute';
+
+    return Container(
+      padding: const EdgeInsets.fromLTRB(16, 14, 16, 16),
+      decoration: BoxDecoration(
+        gradient: const LinearGradient(
+          colors: [deepNavy, blue],
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+        ),
+        borderRadius: BorderRadius.circular(22),
+        boxShadow: [
+          BoxShadow(
+            color: navy.withOpacity(.25),
+            blurRadius: 20,
+            offset: const Offset(0, 8),
+          ),
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                decoration: BoxDecoration(
+                  color: yellow,
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Text(
+                  'NOW PRACTICING',
+                  style: GoogleFonts.poppins(
+                    color: deepNavy,
+                    fontSize: 9,
+                    fontWeight: FontWeight.w800,
+                    letterSpacing: .4,
+                  ),
+                ),
+              ),
+              const Spacer(),
+              const Icon(Icons.timer_outlined, color: Colors.white70, size: 15),
+              const SizedBox(width: 4),
+              _Elapsed(
+                since: cc.currentSince.value,
+                style: GoogleFonts.poppins(
+                  color: Colors.white,
+                  fontSize: 12,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 14),
+          Row(
+            children: [
+              _avatar(cur.name, 28, ring: speaking, onDark: true),
+              const SizedBox(width: 14),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      cur.name,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: GoogleFonts.poppins(
+                        color: Colors.white,
+                        fontSize: 19,
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Row(
+                      children: [
+                        Icon(
+                          !inClass
+                              ? Icons.person_off_rounded
+                              : micOn
+                              ? Icons.mic_rounded
+                              : Icons.mic_off_rounded,
+                          size: 14,
+                          color: micOn ? teal : Colors.white70,
+                        ),
+                        const SizedBox(width: 5),
+                        Expanded(
+                          child: Text(
+                            status,
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                            style: GoogleFonts.poppins(
+                              color: Colors.white.withOpacity(.80),
+                              fontSize: 10.5,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+              if (speaking) const _SpeakingBars(),
+            ],
+          ),
+          const SizedBox(height: 16),
+          Row(
+            children: [
+              Expanded(
+                child: OutlinedButton.icon(
+                  onPressed: saving ? null : cc.skipCurrent,
+                  icon: const Icon(Icons.skip_next_rounded, size: 18),
+                  label: Text(
+                    'Later',
+                    style: GoogleFonts.poppins(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: Colors.white,
+                    side: BorderSide(color: Colors.white.withOpacity(.45)),
+                    minimumSize: const Size(0, 48),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(14),
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                flex: 2,
+                child: ElevatedButton.icon(
+                  onPressed: saving ? null : _markPracticed,
+                  icon: saving
+                      ? const SizedBox(
+                          width: 16,
+                          height: 16,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2,
+                            color: Colors.white,
+                          ),
+                        )
+                      : const Icon(Icons.check_circle_rounded, size: 20),
+                  label: Text(
+                    saving ? 'Saving…' : 'Mark practiced',
+                    style: GoogleFonts.poppins(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: teal,
+                    foregroundColor: Colors.white,
+                    disabledBackgroundColor: teal.withOpacity(.6),
+                    disabledForegroundColor: Colors.white,
+                    elevation: 0,
+                    minimumSize: const Size(0, 48),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(14),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _roundDoneCard(int doneCount, List<CallParticipantState> students) {
+    return Container(
+      padding: const EdgeInsets.all(18),
+      decoration: BoxDecoration(
+        color: green.withOpacity(.09),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: green.withOpacity(.30)),
+      ),
+      child: Column(
+        children: [
+          const Icon(Icons.celebration_rounded, color: green, size: 34),
+          const SizedBox(height: 8),
+          Text(
+            'Round complete!',
+            style: GoogleFonts.poppins(
+              color: textDark,
+              fontSize: 16,
+              fontWeight: FontWeight.w800,
+            ),
+          ),
+          Text(
+            '$doneCount ${doneCount == 1 ? 'student' : 'students'} practiced',
+            style: GoogleFonts.poppins(color: textSecondary, fontSize: 11.5),
+          ),
+          const SizedBox(height: 14),
+          Row(
+            children: [
+              Expanded(
+                child: OutlinedButton(
+                  onPressed: cc.endRound,
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: navy,
+                    side: BorderSide(color: navy.withOpacity(.25)),
+                    minimumSize: const Size(0, 44),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                  ),
+                  child: Text(
+                    'Close round',
+                    style: GoogleFonts.poppins(fontSize: 11.5, fontWeight: FontWeight.w700),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: ElevatedButton(
+                  onPressed: () => _openPicker(students),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: navy,
+                    foregroundColor: Colors.white,
+                    elevation: 0,
+                    minimumSize: const Size(0, 44),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                  ),
+                  child: Text(
+                    'Pick more',
+                    style: GoogleFonts.poppins(fontSize: 11.5, fontWeight: FontWeight.w700),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _sectionTitle(String title, int count, IconData icon) {
+    return Row(
+      children: [
+        Icon(icon, size: 16, color: navy),
+        const SizedBox(width: 6),
+        Text(
+          title,
+          style: GoogleFonts.poppins(
+            color: textDark,
+            fontSize: 13,
+            fontWeight: FontWeight.w800,
+          ),
+        ),
+        const SizedBox(width: 6),
+        Text(
+          '$count',
+          style: GoogleFonts.poppins(
+            color: textSecondary,
+            fontSize: 12,
+            fontWeight: FontWeight.w700,
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _queueRow(int index, PracticeEntry e, CallParticipantState? p) {
+    final bool inClass = p != null;
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.fromLTRB(10, 8, 4, 8),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(15),
+        border: Border.all(color: index == 0 ? yellow : border, width: index == 0 ? 1.4 : 1),
+      ),
+      child: Row(
+        children: [
+          SizedBox(
+            width: 22,
+            child: Text(
+              '${index + 1}',
+              textAlign: TextAlign.center,
+              style: GoogleFonts.poppins(
+                color: textSecondary,
+                fontSize: 12,
+                fontWeight: FontWeight.w800,
+              ),
+            ),
+          ),
+          const SizedBox(width: 6),
+          _avatar(e.name, 17),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  e.name,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: GoogleFonts.poppins(
+                    color: textDark,
+                    fontSize: 12.5,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                Text(
+                  !inClass ? 'Not in class now' : index == 0 ? 'Next' : 'Waiting',
+                  style: GoogleFonts.poppins(
+                    color: !inClass ? red : index == 0 ? amber : textSecondary,
+                    fontSize: 9.5,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          if (index > 0)
+            _iconBtn(Icons.arrow_upward_rounded, 'Move up', textSecondary, () => cc.moveUp(e.id)),
+          _iconBtn(Icons.play_circle_fill_rounded, 'Call now', teal, () => cc.makeCurrent(e)),
+          _iconBtn(Icons.close_rounded, 'Remove', red, () => cc.removeFromQueue(e.id)),
+        ],
+      ),
+    );
+  }
+
+  Widget _iconBtn(IconData icon, String tip, Color color, VoidCallback onTap) {
+    return IconButton(
+      tooltip: tip,
+      onPressed: onTap,
+      visualDensity: VisualDensity.compact,
+      constraints: const BoxConstraints(minWidth: 36, minHeight: 36),
+      padding: EdgeInsets.zero,
+      icon: Icon(icon, color: color, size: 21),
+    );
+  }
+
+  Widget _doneChip(PracticeEntry e) {
+    return InkWell(
+      borderRadius: BorderRadius.circular(20),
+      onTap: () => _confirmUndo(e),
+      child: Container(
+        padding: const EdgeInsets.fromLTRB(6, 5, 10, 5),
+        decoration: BoxDecoration(
+          color: green.withOpacity(.09),
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(color: green.withOpacity(.25)),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(Icons.check_circle_rounded, color: green, size: 16),
+            const SizedBox(width: 5),
+            Text(
+              e.name,
+              style: GoogleFonts.poppins(
+                color: textDark,
+                fontSize: 11,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // ---------------------------------------------------------------------
+  // STUDENTS TAB (compact grid)
+  // ---------------------------------------------------------------------
+  Widget _studentsTab(List<CallParticipantState> students) {
+    return Obx(() {
+      final bool locked = cc.micLocked.value;
+      final Set<String> allowed = cc.allowed.toSet();
+      final Set<String> practiced = cc.practicedToday.toSet();
+      final String currentId = cc.current.value?.id ?? '';
+      final List<String> queueIds = cc.queue.map((e) => e.id).toList();
+      final Set<String> otherBatchIds =
+          cc.otherBatch.map((v) => v['userId']?.toString() ?? '').toSet();
+
+      final int speakingCount = students.where((p) => p.isSpeaking).length;
+      final int micCount = students.where((p) => p.isAudioEnabled).length;
+      final int practicedCount = students.where((p) => practiced.contains(p.userId)).length;
+      final int pendingCount = students.length - practicedCount;
+
+      final q = search.trim().toLowerCase();
+      final list = students.where((p) {
+        if (q.isNotEmpty && !_nameOf(p).toLowerCase().contains(q)) return false;
+        switch (studentFilter) {
+          case 'speaking':
+            return p.isSpeaking;
+          case 'mic':
+            return p.isAudioEnabled;
+          case 'practiced':
+            return practiced.contains(p.userId);
+          case 'pending':
+            return !practiced.contains(p.userId);
+          default:
+            return true;
+        }
+      }).toList()
+        ..sort((a, b) {
+          if (a.isSpeaking != b.isSpeaking) return a.isSpeaking ? -1 : 1;
+          if (a.isAudioEnabled != b.isAudioEnabled) return a.isAudioEnabled ? -1 : 1;
+          return _nameOf(a).toLowerCase().compareTo(_nameOf(b).toLowerCase());
+        });
+
+      return Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 14),
+            child: SizedBox(
+              height: 44,
+              child: TextField(
+                controller: _searchCtrl,
+                onChanged: (v) => setState(() => search = v),
+                style: GoogleFonts.poppins(color: textDark, fontSize: 12),
+                decoration: InputDecoration(
+                  hintText: 'Search student…',
+                  hintStyle: GoogleFonts.poppins(color: textSecondary, fontSize: 12),
+                  prefixIcon: const Icon(Icons.search_rounded, color: navy, size: 19),
+                  suffixIcon: search.isEmpty
+                      ? null
+                      : IconButton(
+                          onPressed: () {
+                            _searchCtrl.clear();
+                            setState(() => search = '');
+                          },
+                          icon: const Icon(Icons.close_rounded, size: 17, color: textSecondary),
+                        ),
+                  filled: true,
+                  fillColor: Colors.white,
+                  contentPadding: EdgeInsets.zero,
+                  enabledBorder: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(12),
+                    borderSide: const BorderSide(color: border),
+                  ),
+                  focusedBorder: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(12),
+                    borderSide: const BorderSide(color: navy, width: 1.2),
+                  ),
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(height: 8),
+          SizedBox(
+            height: 34,
+            child: ListView(
+              scrollDirection: Axis.horizontal,
+              padding: const EdgeInsets.symmetric(horizontal: 14),
+              children: [
+                _filterChip('all', 'All', students.length),
+                _filterChip('speaking', 'Speaking', speakingCount),
+                _filterChip('mic', 'Mic on', micCount),
+                _filterChip('pending', 'Not practiced', pendingCount),
+                _filterChip('practiced', 'Practiced', practicedCount),
+              ],
+            ),
+          ),
+          const SizedBox(height: 8),
+          Expanded(
+            child: list.isEmpty
+                ? _emptyStudents(students.isEmpty)
+                : GridView.builder(
+                    physics: const BouncingScrollPhysics(),
+                    padding: const EdgeInsets.fromLTRB(14, 2, 14, 16),
+                    gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+                      maxCrossAxisExtent: 110,
+                      mainAxisExtent: 114,
+                      crossAxisSpacing: 8,
+                      mainAxisSpacing: 8,
+                    ),
+                    itemCount: list.length,
+                    itemBuilder: (context, i) {
+                      final p = list[i];
+                      final pos = queueIds.indexOf(p.userId);
+                      return _studentTile(
+                        p,
+                        locked: locked,
+                        allowed: allowed.contains(p.userId),
+                        practiced: practiced.contains(p.userId),
+                        isCurrent: currentId == p.userId,
+                        queuePos: pos < 0 ? 0 : pos + 1,
+                        otherBatch: otherBatchIds.contains(p.userId),
+                      );
+                    },
+                  ),
+          ),
+        ],
+      );
+    });
+  }
+
+  Widget _filterChip(String key, String label, int count) {
+    final bool selected = studentFilter == key;
+    return Padding(
+      padding: const EdgeInsets.only(right: 7),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(10),
+        onTap: () => setState(() => studentFilter = key),
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 160),
+          padding: const EdgeInsets.symmetric(horizontal: 11),
+          alignment: Alignment.center,
+          decoration: BoxDecoration(
+            color: selected ? navy : Colors.white,
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(color: selected ? navy : border),
+          ),
+          child: Text(
+            '$label  $count',
+            style: GoogleFonts.poppins(
+              color: selected ? Colors.white : textDark,
+              fontSize: 10.5,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _studentTile(
+    CallParticipantState p, {
+    required bool locked,
+    required bool allowed,
+    required bool practiced,
+    required bool isCurrent,
+    required int queuePos,
+    bool otherBatch = false,
+  }) {
+    final String name = _nameOf(p);
+    final String first = name.split(' ').first;
+    final bool speaking = p.isSpeaking;
+    final bool micOn = p.isAudioEnabled;
+    final bool canSpeak = !locked || allowed;
+    final bool paid = _isPaid(p);
+
+    final IconData micIcon = micOn
+        ? Icons.mic_rounded
+        : canSpeak
+        ? Icons.mic_off_rounded
+        : Icons.lock_rounded;
+    final Color micColor = micOn ? green : canSpeak ? red : amber;
+
+    String tag = '';
+    Color tagColor = textSecondary;
+    if (isCurrent) {
+      tag = 'Speaking turn';
+      tagColor = amber;
+    } else if (otherBatch) {
+      tag = 'Other batch';
+      tagColor = red;
+    } else if (queuePos > 0) {
+      tag = '#$queuePos in line';
+      tagColor = navy;
+    } else if (practiced) {
+      tag = '✓ Practiced';
+      tagColor = green;
+    } else if (locked && allowed) {
+      tag = 'Allowed';
+      tagColor = green;
+    }
+
+    return InkWell(
+      borderRadius: BorderRadius.circular(16),
+      onTap: () => _openStudentActions(p),
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 180),
+        padding: const EdgeInsets.fromLTRB(6, 10, 6, 6),
+        decoration: BoxDecoration(
+          color: isCurrent ? const Color(0xFFFFFBEA) : Colors.white,
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(
+            color: speaking
+                ? teal
+                : isCurrent
+                ? yellow
+                : border,
+            width: speaking || isCurrent ? 2 : 1,
+          ),
+        ),
+        child: Column(
+          children: [
+            Stack(
+              clipBehavior: Clip.none,
+              children: [
+                _avatar(name, 22, ring: speaking),
+                Positioned(
+                  right: -3,
+                  bottom: -3,
+                  child: Container(
+                    width: 21,
+                    height: 21,
+                    decoration: BoxDecoration(
+                      color: Colors.white,
+                      shape: BoxShape.circle,
+                      border: Border.all(color: micColor.withOpacity(.5)),
+                    ),
+                    child: Icon(micIcon, size: 12, color: micColor),
+                  ),
+                ),
+                if (!paid)
+                  Positioned(
+                    left: -3,
+                    top: -3,
+                    child: Container(
+                      width: 17,
+                      height: 17,
+                      alignment: Alignment.center,
+                      decoration: const BoxDecoration(
+                        color: yellow,
+                        shape: BoxShape.circle,
+                      ),
+                      child: Text(
+                        '₹',
+                        style: GoogleFonts.poppins(
+                          color: deepNavy,
+                          fontSize: 9,
+                          fontWeight: FontWeight.w800,
+                        ),
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 7),
+            Text(
+              first,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              textAlign: TextAlign.center,
+              style: GoogleFonts.poppins(
+                color: textDark,
+                fontSize: 11.5,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+            const SizedBox(height: 2),
+            Text(
+              tag,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: GoogleFonts.poppins(
+                color: tagColor,
+                fontSize: 8.5,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _emptyStudents(bool nobody) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: 64,
+              height: 64,
+              decoration: BoxDecoration(
+                color: teal.withOpacity(.10),
+                shape: BoxShape.circle,
+              ),
+              child: const Icon(Icons.people_outline_rounded, color: teal, size: 30),
+            ),
+            const SizedBox(height: 12),
+            Text(
+              nobody ? 'Waiting for students' : 'No students match',
+              style: GoogleFonts.poppins(
+                color: textDark,
+                fontSize: 14,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+            const SizedBox(height: 4),
+            Text(
+              nobody
+                  ? 'Your class is live. Students appear here as they join.'
+                  : 'Try another filter or search.',
+              textAlign: TextAlign.center,
+              style: GoogleFonts.poppins(color: textSecondary, fontSize: 11),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // ---------------------------------------------------------------------
+  // Bottom sheets
+  // ---------------------------------------------------------------------
+  void _openStudentActions(CallParticipantState p) {
+    final String name = _nameOf(p);
+    final bool isCurrent = cc.current.value?.id == p.userId;
+    final bool queued = cc.isQueued(p.userId);
+    final bool practiced = cc.practicedToday.contains(p.userId);
+    final bool locked = cc.micLocked.value;
+    final bool allowed = cc.allowed.contains(p.userId);
+    final bool paid = _isPaid(p);
+
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.transparent,
+      isScrollControlled: true,
+      builder: (ctx) {
+        void run(VoidCallback action) {
+          Navigator.pop(ctx);
+          action();
+        }
+
+        return Container(
+          decoration: const BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+          ),
+          child: SafeArea(
+            top: false,
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(18, 10, 18, 12),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  _sheetHandle(),
+                  Row(
+                    children: [
+                      _avatar(name, 24, ring: p.isSpeaking),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              name,
+                              style: GoogleFonts.poppins(
+                                color: textDark,
+                                fontSize: 15,
+                                fontWeight: FontWeight.w800,
+                              ),
+                            ),
+                            Text(
+                              '${paid ? 'Fee paid' : 'Fee unpaid'} • ${practiced ? 'Practiced today ✓' : 'Not practiced yet'}',
+                              style: GoogleFonts.poppins(
+                                color: textSecondary,
+                                fontSize: 10.5,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 12),
+                  if (isCurrent)
+                    _actionTile(Icons.check_circle_rounded, 'Mark practiced', green,
+                        () => run(_markPracticed))
+                  else
+                    _actionTile(Icons.record_voice_over_rounded, 'Practice now', navy, () {
+                      run(() {
+                        cc.makeCurrent(_entry(p));
+                        setState(() => tab = 0);
+                      });
+                    }),
+                  if (!queued)
+                    _actionTile(Icons.playlist_add_rounded, 'Add to practice line', blue, () {
+                      run(() {
+                        cc.addToQueue([_entry(p)]);
+                        _toast('$name added to the practice line');
+                      });
+                    })
+                  else if (!isCurrent)
+                    _actionTile(Icons.remove_circle_outline_rounded, 'Remove from practice line',
+                        textSecondary, () => run(() => cc.removeFromQueue(p.userId))),
+                  if (locked)
+                    allowed
+                        ? _actionTile(Icons.lock_rounded, 'Stop allowing (mute)', amber,
+                            () => run(() => cc.setAllowed(p.userId, false)))
+                        : _actionTile(Icons.lock_open_rounded, 'Allow to speak', green,
+                            () => run(() => cc.setAllowed(p.userId, true))),
+                  if (p.isAudioEnabled)
+                    _actionTile(Icons.mic_off_rounded, 'Mute mic', textSecondary,
+                        () => run(() => cc.muteOne(p.userId))),
+                  if (practiced)
+                    _actionTile(Icons.undo_rounded, 'Undo “practiced”', textSecondary,
+                        () => run(() => _confirmUndo(_entry(p)))),
+                  const Divider(height: 18),
+                  _actionTile(Icons.person_remove_rounded, 'Remove from class', red,
+                      () => run(() => _kickParticipant(p))),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  /// Students who joined this class outside their own batch time
+  void _openOtherBatchSheet() {
+    cc.loadOtherBatch();
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (ctx) => Container(
+        constraints: BoxConstraints(maxHeight: MediaQuery.sizeOf(ctx).height * .8),
+        decoration: const BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+        ),
+        child: SafeArea(
+          top: false,
+          child: Obx(() {
+            final list = cc.otherBatch.toList();
+            return Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const SizedBox(height: 10),
+                _sheetHandle(),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(18, 0, 18, 8),
+                  child: Row(
+                    children: [
+                      const Icon(Icons.swap_horiz_rounded, color: amber),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              'Joined from another batch',
+                              style: GoogleFonts.poppins(
+                                color: textDark,
+                                fontSize: 15.5,
+                                fontWeight: FontWeight.w800,
+                              ),
+                            ),
+                            Text(
+                              'Today • these joins are NOT counted as attendance',
+                              style: GoogleFonts.poppins(color: textSecondary, fontSize: 10.5),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                if (list.isEmpty)
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(24, 20, 24, 30),
+                    child: Text(
+                      'Everyone in your class is in their own batch 👍',
+                      textAlign: TextAlign.center,
+                      style: GoogleFonts.poppins(color: textSecondary, fontSize: 12),
+                    ),
+                  )
+                else
+                  Flexible(
+                    child: ListView.separated(
+                      shrinkWrap: true,
+                      padding: const EdgeInsets.fromLTRB(14, 4, 14, 16),
+                      itemCount: list.length,
+                      separatorBuilder: (_, __) => const SizedBox(height: 8),
+                      itemBuilder: (_, i) {
+                        final v = list[i];
+                        final name = (v['userName'] ?? 'Student').toString();
+                        final own = BatchSlots.shortOf(v['ownBatch'], fallback: 'Not set');
+                        final joinedRaw = (v['joinedBatch'] ?? '').toString();
+                        final joined = BatchSlots.shortOf(joinedRaw, fallback: joinedRaw);
+                        return Container(
+                          padding: const EdgeInsets.all(12),
+                          decoration: BoxDecoration(
+                            color: background,
+                            borderRadius: BorderRadius.circular(14),
+                          ),
+                          child: Row(
+                            children: [
+                              _avatar(name, 18),
+                              const SizedBox(width: 10),
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      name,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: GoogleFonts.poppins(
+                                        color: textDark,
+                                        fontSize: 12.5,
+                                        fontWeight: FontWeight.w700,
+                                      ),
+                                    ),
+                                    const SizedBox(height: 2),
+                                    Text(
+                                      'Own batch: $own',
+                                      style: GoogleFonts.poppins(
+                                        color: green,
+                                        fontSize: 10.5,
+                                        fontWeight: FontWeight.w700,
+                                      ),
+                                    ),
+                                    Text(
+                                      'Joined: $joined',
+                                      style: GoogleFonts.poppins(
+                                        color: red,
+                                        fontSize: 10.5,
+                                        fontWeight: FontWeight.w700,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ],
+                          ),
+                        );
+                      },
+                    ),
+                  ),
+              ],
+            );
+          }),
+        ),
+      ),
+    );
+  }
+
+  Widget _sheetHandle() => Container(
+    width: 42,
+    height: 4,
+    margin: const EdgeInsets.only(bottom: 14),
+    decoration: BoxDecoration(
+      color: const Color(0xFFD0DCE5),
+      borderRadius: BorderRadius.circular(4),
+    ),
+  );
+
+  Widget _actionTile(IconData icon, String label, Color color, VoidCallback onTap) {
+    return InkWell(
+      borderRadius: BorderRadius.circular(12),
+      onTap: onTap,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 4),
+        child: Row(
+          children: [
+            Container(
+              width: 36,
+              height: 36,
+              decoration: BoxDecoration(
+                color: color.withOpacity(.11),
+                borderRadius: BorderRadius.circular(11),
+              ),
+              child: Icon(icon, color: color, size: 19),
+            ),
+            const SizedBox(width: 12),
+            Text(
+              label,
+              style: GoogleFonts.poppins(
+                color: color == textSecondary ? textDark : color,
+                fontSize: 13,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Pick students in the order they should speak
+  void _openPicker(List<CallParticipantState> students) {
+    final available = students.where((p) => !cc.isQueued(p.userId)).toList()
+      ..sort((a, b) {
+        final pa = cc.practicedToday.contains(a.userId);
+        final pb = cc.practicedToday.contains(b.userId);
+        if (pa != pb) return pa ? 1 : -1; // not practiced first
+        return _nameOf(a).toLowerCase().compareTo(_nameOf(b).toLowerCase());
+      });
+
+    if (available.isEmpty) {
+      _toast(
+        students.isEmpty
+            ? 'No students in the class yet.'
+            : 'Everyone in class is already in the practice line.',
+      );
+      return;
+    }
+
+    final List<String> picked = [];
+    String q = '';
+
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setSheet) {
+          final visible = available
+              .where((p) => _nameOf(p).toLowerCase().contains(q.trim().toLowerCase()))
+              .toList();
+          final notPracticed = available
+              .where((p) => !cc.practicedToday.contains(p.userId))
+              .map((p) => p.userId)
+              .toList();
+
+          return DraggableScrollableSheet(
+            initialChildSize: .86,
+            minChildSize: .5,
+            maxChildSize: .95,
+            expand: false,
+            builder: (ctx, scroll) => Container(
+              decoration: const BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+              ),
+              child: Column(
+                children: [
+                  const SizedBox(height: 10),
+                  _sheetHandle(),
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 18),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                'Pick students',
+                                style: GoogleFonts.poppins(
+                                  color: textDark,
+                                  fontSize: 16,
+                                  fontWeight: FontWeight.w800,
+                                ),
+                              ),
+                              Text(
+                                'Tap in the order they should speak',
+                                style: GoogleFonts.poppins(
+                                  color: textSecondary,
+                                  fontSize: 11,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                        IconButton(
+                          onPressed: () => Navigator.pop(ctx),
+                          icon: const Icon(Icons.close_rounded, color: textSecondary),
+                        ),
+                      ],
+                    ),
+                  ),
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(18, 8, 18, 4),
+                    child: SizedBox(
+                      height: 42,
+                      child: TextField(
+                        onChanged: (v) => setSheet(() => q = v),
+                        style: GoogleFonts.poppins(color: textDark, fontSize: 12),
+                        decoration: InputDecoration(
+                          hintText: 'Search…',
+                          hintStyle: GoogleFonts.poppins(color: textSecondary, fontSize: 12),
+                          prefixIcon: const Icon(Icons.search_rounded, color: navy, size: 19),
+                          filled: true,
+                          fillColor: background,
+                          contentPadding: EdgeInsets.zero,
+                          border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(12),
+                            borderSide: BorderSide.none,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 10),
+                    child: Row(
+                      children: [
+                        if (notPracticed.isNotEmpty)
+                          TextButton(
+                            onPressed: () => setSheet(() {
+                              for (final id in notPracticed) {
+                                if (!picked.contains(id)) picked.add(id);
+                              }
+                            }),
+                            child: Text(
+                              'Select all not practiced (${notPracticed.length})',
+                              style: GoogleFonts.poppins(
+                                color: navy,
+                                fontSize: 11.5,
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                          ),
+                        const Spacer(),
+                        if (picked.isNotEmpty)
+                          TextButton(
+                            onPressed: () => setSheet(picked.clear),
+                            child: Text(
+                              'Clear',
+                              style: GoogleFonts.poppins(
+                                color: red,
+                                fontSize: 11.5,
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                  Expanded(
+                    child: ListView.builder(
+                      controller: scroll,
+                      padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+                      itemCount: visible.length,
+                      itemBuilder: (ctx, i) {
+                        final p = visible[i];
+                        final name = _nameOf(p);
+                        final order = picked.indexOf(p.userId);
+                        final selected = order >= 0;
+                        final done = cc.practicedToday.contains(p.userId);
+                        return InkWell(
+                          borderRadius: BorderRadius.circular(12),
+                          onTap: () => setSheet(() {
+                            if (selected) {
+                              picked.remove(p.userId);
+                            } else {
+                              picked.add(p.userId);
+                            }
+                          }),
+                          child: Container(
+                            margin: const EdgeInsets.only(bottom: 4),
+                            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+                            decoration: BoxDecoration(
+                              color: selected ? teal.withOpacity(.08) : Colors.transparent,
+                              borderRadius: BorderRadius.circular(12),
+                            ),
+                            child: Row(
+                              children: [
+                                AnimatedContainer(
+                                  duration: const Duration(milliseconds: 150),
+                                  width: 28,
+                                  height: 28,
+                                  alignment: Alignment.center,
+                                  decoration: BoxDecoration(
+                                    color: selected ? teal : Colors.white,
+                                    shape: BoxShape.circle,
+                                    border: Border.all(
+                                      color: selected ? teal : const Color(0xFFC5D5E0),
+                                      width: 1.6,
+                                    ),
+                                  ),
+                                  child: selected
+                                      ? Text(
+                                          '${order + 1}',
+                                          style: GoogleFonts.poppins(
+                                            color: Colors.white,
+                                            fontSize: 12,
+                                            fontWeight: FontWeight.w800,
+                                          ),
+                                        )
+                                      : null,
+                                ),
+                                const SizedBox(width: 12),
+                                _avatar(name, 17),
+                                const SizedBox(width: 10),
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    children: [
+                                      Text(
+                                        name,
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: GoogleFonts.poppins(
+                                          color: textDark,
+                                          fontSize: 12.5,
+                                          fontWeight: FontWeight.w700,
+                                        ),
+                                      ),
+                                      Text(
+                                        done ? 'Practiced today ✓' : 'Not practiced yet',
+                                        style: GoogleFonts.poppins(
+                                          color: done ? green : textSecondary,
+                                          fontSize: 10,
+                                          fontWeight: FontWeight.w600,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                                Icon(
+                                  p.isAudioEnabled ? Icons.mic_rounded : Icons.mic_off_rounded,
+                                  size: 17,
+                                  color: p.isAudioEnabled ? green : const Color(0xFFB0BFCB),
+                                ),
+                              ],
+                            ),
+                          ),
+                        );
+                      },
+                    ),
+                  ),
+                  SafeArea(
+                    top: false,
+                    child: Padding(
+                      padding: const EdgeInsets.fromLTRB(18, 6, 18, 12),
+                      child: SizedBox(
+                        width: double.infinity,
+                        height: 50,
+                        child: ElevatedButton.icon(
+                          onPressed: picked.isEmpty
+                              ? null
+                              : () {
+                                  final byId = {for (final p in available) p.userId: p};
+                                  final entries = picked
+                                      .where(byId.containsKey)
+                                      .map((id) => _entry(byId[id]!))
+                                      .toList();
+                                  final wasActive = cc.practiceActive;
+                                  Navigator.pop(ctx);
+                                  cc.addToQueue(entries);
+                                  setState(() => tab = 0);
+                                  _toast(
+                                    wasActive
+                                        ? '${entries.length} added to the practice line'
+                                        : 'Practice started: ${entries.first.name} first',
+                                    color: green,
+                                    icon: Icons.record_voice_over_rounded,
+                                  );
+                                },
+                          icon: const Icon(Icons.play_arrow_rounded),
+                          label: Text(
+                            picked.isEmpty
+                                ? 'Select students'
+                                : cc.practiceActive
+                                ? 'Add ${picked.length} to the line'
+                                : 'Start practice (${picked.length})',
+                            style: GoogleFonts.poppins(
+                              fontSize: 13,
+                              fontWeight: FontWeight.w800,
+                            ),
+                          ),
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: teal,
+                            foregroundColor: Colors.white,
+                            disabledBackgroundColor: const Color(0xFFD5E2EA),
+                            disabledForegroundColor: textSecondary,
+                            elevation: 0,
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(14),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  // ---------------------------------------------------------------------
+  // Confirm dialogs
+  // ---------------------------------------------------------------------
+  Future<bool> _confirm({
+    required IconData icon,
+    required Color color,
+    required String title,
+    required String message,
+    required String confirmLabel,
+  }) async {
+    final result = await Get.dialog<bool>(
+      Dialog(
+        backgroundColor: Colors.transparent,
+        child: Container(
+          constraints: const BoxConstraints(maxWidth: 400),
+          padding: const EdgeInsets.all(22),
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(22),
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                width: 54,
+                height: 54,
+                decoration: BoxDecoration(
+                  color: color.withOpacity(.11),
+                  shape: BoxShape.circle,
+                ),
+                child: Icon(icon, color: color, size: 27),
+              ),
+              const SizedBox(height: 14),
+              Text(
+                title,
+                textAlign: TextAlign.center,
+                style: GoogleFonts.poppins(
+                  color: textDark,
+                  fontSize: 16,
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+              const SizedBox(height: 6),
+              Text(
+                message,
+                textAlign: TextAlign.center,
+                style: GoogleFonts.poppins(
+                  color: textSecondary,
+                  fontSize: 11.5,
+                  height: 1.45,
+                ),
+              ),
+              const SizedBox(height: 20),
+              Row(
+                children: [
+                  Expanded(
+                    child: OutlinedButton(
+                      onPressed: () => Get.back(result: false),
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: navy,
+                        side: BorderSide(color: navy.withOpacity(.2)),
+                        minimumSize: const Size(0, 44),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                      ),
+                      child: Text(
+                        'Cancel',
+                        style: GoogleFonts.poppins(fontSize: 12, fontWeight: FontWeight.w600),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: ElevatedButton(
+                      onPressed: () => Get.back(result: true),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: color,
+                        foregroundColor: Colors.white,
+                        elevation: 0,
+                        minimumSize: const Size(0, 44),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                      ),
+                      child: Text(
+                        confirmLabel,
+                        style: GoogleFonts.poppins(fontSize: 12, fontWeight: FontWeight.w700),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+    return result == true;
+  }
+
+  Future<void> _confirmUndo(PracticeEntry e) async {
+    final yes = await _confirm(
+      icon: Icons.undo_rounded,
+      color: amber,
+      title: 'Undo practice for ${e.name}?',
+      message: 'They will show as “not practiced” for today (also for the admin).',
+      confirmLabel: 'Undo',
+    );
+    if (!yes) return;
+    final ok = await cc.undoPractice(e);
+    _toast(ok ? 'Undone' : 'Could not undo. Check the internet.', color: ok ? deepNavy : red);
+  }
+
+  Future<void> _confirmEndRound() async {
+    final yes = await _confirm(
+      icon: Icons.stop_circle_outlined,
+      color: red,
+      title: 'End this practice round?',
+      message: 'The line is cleared. Students already marked stay saved as practiced.',
+      confirmLabel: 'End round',
+    );
+    if (yes) cc.endRound();
+  }
+
+  Future<void> _kickParticipant(CallParticipantState p) async {
+    final name = _nameOf(p);
+    final yes = await _confirm(
+      icon: Icons.person_remove_rounded,
+      color: red,
+      title: 'Remove $name?',
+      message: 'They will be removed from this live class.',
+      confirmLabel: 'Remove',
+    );
+    if (!yes) return;
+    cc.removeFromQueue(p.userId);
+    final r = await widget.call.kickUser(p.userId);
+    _toast(
+      r.isFailure ? 'Could not remove $name' : '$name was removed',
+      color: r.isFailure ? red : deepNavy,
+    );
+  }
+
+  // ---------------------------------------------------------------------
+  // Bottom control bar
+  // ---------------------------------------------------------------------
+  Widget _controlBar(CallParticipantState? me, List<CallParticipantState> students) {
+    final bool myMicOn = me?.isAudioEnabled ?? false;
+    return Container(
+      padding: const EdgeInsets.fromLTRB(6, 10, 6, 10),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        border: const Border(top: BorderSide(color: border)),
+        boxShadow: [
+          BoxShadow(
+            color: navy.withOpacity(.07),
+            blurRadius: 16,
+            offset: const Offset(0, -4),
+          ),
+        ],
+      ),
+      child: Row(
+        children: [
+          _roundAction(
+            icon: myMicOn ? Icons.mic_rounded : Icons.mic_off_rounded,
+            label: myMicOn ? 'Mute me' : 'Unmute me',
+            color: myMicOn ? teal : red,
+            filled: !myMicOn,
+            onTap: () => _toggleTeacherMic(myMicOn),
+          ),
+          Obx(() {
+            final locked = cc.micLocked.value;
+            return _roundAction(
+              icon: locked ? Icons.lock_open_rounded : Icons.mic_off_rounded,
+              label: locked ? 'Unlock all' : 'Mute all',
+              color: locked ? amber : blue,
+              filled: locked,
+              onTap: _toggleLock,
+            );
+          }),
+          _roundAction(
+            icon: Icons.playlist_add_rounded,
+            label: 'Practice',
+            color: navy,
+            onTap: () => _openPicker(students),
+          ),
+          _roundAction(
+            icon: Icons.picture_in_picture_alt_rounded,
+            label: 'Minimize',
+            color: periwinkle,
+            onTap: _minimize,
+          ),
+          _roundAction(
+            icon: Icons.call_end_rounded,
+            label: 'End',
+            color: red,
+            filled: true,
+            onTap: _showEndClassDialog,
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _roundAction({
+    required IconData icon,
+    required String label,
+    required Color color,
+    required VoidCallback onTap,
+    bool filled = false,
+  }) {
+    return Expanded(
+      child: InkWell(
+        borderRadius: BorderRadius.circular(14),
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(vertical: 2),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              AnimatedContainer(
+                duration: const Duration(milliseconds: 180),
+                width: 48,
+                height: 48,
+                decoration: BoxDecoration(
+                  color: filled ? color : color.withOpacity(.12),
+                  shape: BoxShape.circle,
+                ),
+                child: Icon(icon, color: filled ? Colors.white : color, size: 22),
+              ),
+              const SizedBox(height: 5),
+              Text(
+                label,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: GoogleFonts.poppins(
+                  color: textDark,
+                  fontSize: 9.5,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _showEndClassDialog() {
     Get.dialog(
       Dialog(
         backgroundColor: Colors.transparent,
         child: Container(
-          constraints: const BoxConstraints(maxWidth: 410),
-          padding: const EdgeInsets.all(24),
+          constraints: const BoxConstraints(maxWidth: 420),
+          padding: const EdgeInsets.all(22),
           decoration: BoxDecoration(
             color: Colors.white,
             borderRadius: BorderRadius.circular(24),
@@ -2015,896 +5258,195 @@ class _TeacherBroadcastScreenState extends State<TeacherBroadcastScreen> {
                   color: red.withOpacity(.10),
                   shape: BoxShape.circle,
                 ),
-                child: const Icon(
-                  Icons.person_remove_rounded,
-                  color: red,
-                  size: 28,
-                ),
+                child: const Icon(Icons.call_end_rounded, color: red, size: 27),
               ),
-              const SizedBox(height: 16),
+              const SizedBox(height: 14),
               Text(
-                'Remove $participantName?',
-                textAlign: TextAlign.center,
+                'Leave or end the class?',
                 style: GoogleFonts.poppins(
-                  color: deepNavy,
+                  color: textDark,
                   fontSize: 17,
-                  fontWeight: FontWeight.w700,
+                  fontWeight: FontWeight.w800,
                 ),
               ),
               const SizedBox(height: 6),
               Text(
-                'Are you sure you want to kick this student out of the live class due to misbehavior?',
+                'Leaving keeps the room open for students. Ending closes it for everyone.',
                 textAlign: TextAlign.center,
                 style: GoogleFonts.poppins(
                   color: textSecondary,
-                  fontSize: 11,
-                  height: 1.4,
+                  fontSize: 11.5,
+                  height: 1.45,
                 ),
               ),
-              const SizedBox(height: 22),
-              Row(
-                children: [
-                  Expanded(
-                    child: OutlinedButton(
-                      onPressed: () => Get.back(),
-                      style: OutlinedButton.styleFrom(
-                        foregroundColor: navy,
-                        side: BorderSide(color: navy.withOpacity(.18)),
-                        minimumSize: const Size(0, 44),
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(12),
-                        ),
-                      ),
-                      child: Text(
-                        'Cancel',
-                        style: GoogleFonts.poppins(
-                          fontSize: 11,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
+              const SizedBox(height: 20),
+              SizedBox(
+                width: double.infinity,
+                child: OutlinedButton.icon(
+                  onPressed: () {
+                    Get.back();
+                    _leaveClassOnly();
+                  },
+                  icon: const Icon(Icons.logout_rounded, color: navy),
+                  label: Text(
+                    'Leave (students stay)',
+                    style: GoogleFonts.poppins(
+                      color: navy,
+                      fontSize: 12,
+                      fontWeight: FontWeight.w700,
                     ),
                   ),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: ElevatedButton(
-                      onPressed: () async {
-                        Get.back();
-                        try {
-                          await widget.call.kickUser(participantId);
-                          Get.snackbar(
-                            "Student Removed",
-                            "$participantName has been kicked out.",
-                            backgroundColor: red,
-                            colorText: Colors.white,
-                          );
-                        } catch (e) {
-                          debugPrint("Kick Error: $e");
-                        }
-                      },
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: red,
-                        foregroundColor: Colors.white,
-                        elevation: 0,
-                        minimumSize: const Size(0, 44),
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(12),
-                        ),
-                      ),
-                      child: Text(
-                        'Kick Out',
-                        style: GoogleFonts.poppins(
-                          fontSize: 11,
-                          fontWeight: FontWeight.w700,
-                        ),
-                      ),
+                  style: OutlinedButton.styleFrom(
+                    side: BorderSide(color: navy.withOpacity(.25)),
+                    minimumSize: const Size(0, 46),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
                     ),
                   ),
-                ],
+                ),
+              ),
+              const SizedBox(height: 10),
+              SizedBox(
+                width: double.infinity,
+                child: ElevatedButton.icon(
+                  onPressed: () {
+                    Get.back();
+                    _endClassAndBroadcast();
+                  },
+                  icon: const Icon(Icons.stop_circle_rounded),
+                  label: Text(
+                    'End class for everyone',
+                    style: GoogleFonts.poppins(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: red,
+                    foregroundColor: Colors.white,
+                    elevation: 0,
+                    minimumSize: const Size(0, 46),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 6),
+              TextButton(
+                onPressed: () => Get.back(),
+                child: Text(
+                  'Cancel',
+                  style: GoogleFonts.poppins(
+                    color: textSecondary,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
               ),
             ],
           ),
         ),
       ),
     );
+  }
+
+  Widget _avatar(String name, double radius, {bool ring = false, bool onDark = false}) {
+    final Color color = _colorFor(name);
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 200),
+      padding: EdgeInsets.all(ring ? 2 : 0),
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        border: ring ? Border.all(color: teal, width: 2.5) : null,
+      ),
+      child: CircleAvatar(
+        radius: radius,
+        backgroundColor: onDark ? Colors.white.withOpacity(.16) : color.withOpacity(.14),
+        child: Text(
+          _initial(name),
+          style: GoogleFonts.poppins(
+            color: onDark ? Colors.white : color,
+            fontSize: radius * .78,
+            fontWeight: FontWeight.w800,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// Pulsing red "live" dot
+class _LiveDot extends StatefulWidget {
+  const _LiveDot();
+
+  @override
+  State<_LiveDot> createState() => _LiveDotState();
+}
+
+class _LiveDotState extends State<_LiveDot> with SingleTickerProviderStateMixin {
+  late final AnimationController _c = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 900),
+  )..repeat(reverse: true);
+
+  @override
+  void dispose() {
+    _c.dispose();
+    super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    final String teacherId =
-        (widget.teacherData['_id'] ?? widget.teacherData['id'] ?? '')
-            .toString();
-
-    return PopScope(
-      canPop: false,
-      onPopInvokedWithResult: (didPop, result) {
-        if (didPop) return;
-        Get.until((route) => route.isFirst);
-        GlobalAudioOverlayController.showOverlay(
-          context,
-          widget.call,
-          teacherId,
-          "Live Studio",
-          widget.teacherData,
-          widget.enrolledStudents,
-        );
-      },
-      child: Scaffold(
-        backgroundColor: background,
-        appBar: _buildAppBar(context, teacherId),
-        body: SafeArea(
-          child: StreamBuilder<CallState>(
-            stream: widget.call.state.asStream(),
-            builder: (context, snapshot) {
-              final callState = snapshot.data;
-              final rawParticipants = callState?.callParticipants ?? [];
-              final seenUserIds = <String>{};
-              final participants = rawParticipants.where((p) {
-                if (seenUserIds.contains(p.userId)) return false;
-                seenUserIds.add(p.userId);
-                return true;
-              }).toList();
-
-              final studentCount = participants
-                  .where((p) => !p.roles.contains('admin'))
-                  .length;
-              final speakingParticipants = participants
-                  .where((p) => p.isSpeaking)
-                  .toList();
-              final speaker = speakingParticipants.isNotEmpty
-                  ? speakingParticipants.first
-                  : null;
-
-              return LayoutBuilder(
-                builder: (context, constraints) {
-                  final bool desktop = constraints.maxWidth >= 1000;
-                  final bool tablet =
-                      constraints.maxWidth >= 650 &&
-                      constraints.maxWidth < 1000;
-
-                  return Column(
-                    children: [
-                      _buildLiveHeader(studentCount, speaker, desktop),
-                      Expanded(
-                        child: participants.isEmpty
-                            ? _buildNoStudents()
-                            : desktop
-                            ? _buildDesktopParticipants(participants)
-                            : _buildMobileParticipants(participants),
-                      ),
-                      _buildControlBar(context, desktop, tablet),
-                    ],
-                  );
-                },
-              );
-            },
-          ),
+    return FadeTransition(
+      opacity: Tween<double>(begin: .35, end: 1).animate(_c),
+      child: Container(
+        width: 9,
+        height: 9,
+        decoration: const BoxDecoration(
+          color: Color(0xFFE45757),
+          shape: BoxShape.circle,
         ),
       ),
     );
   }
+}
 
-  PreferredSizeWidget _buildAppBar(BuildContext context, String teacherId) {
-    return AppBar(
-      elevation: 0,
-      scrolledUnderElevation: 0,
-      backgroundColor: navy,
-      foregroundColor: Colors.white,
-      automaticallyImplyLeading: false,
-      toolbarHeight: 70,
-      titleSpacing: 16,
-      title: Row(
-        children: [
-          Container(
-            width: 44,
-            height: 44,
-            decoration: BoxDecoration(
-              color: teal,
-              borderRadius: BorderRadius.circular(14),
-              boxShadow: [
-                BoxShadow(
-                  color: teal.withOpacity(.25),
-                  blurRadius: 14,
-                  offset: const Offset(0, 5),
-                ),
-              ],
-            ),
-            child: const Icon(
-              Icons.graphic_eq_rounded,
-              color: Colors.white,
-              size: 23,
-            ),
-          ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                Text(
-                  'Live Classroom',
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: GoogleFonts.poppins(
-                    color: Colors.white,
-                    fontSize: 15,
-                    fontWeight: FontWeight.w700,
-                  ),
-                ),
-                const SizedBox(height: 2),
-                Text(
-                  '${widget.language} • ${widget.stage}${widget.language.toLowerCase() == 'english' ? ' • Section ${widget.section}' : ''}',
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: GoogleFonts.poppins(
-                    color: Colors.white.withOpacity(.68),
-                    fontSize: 10,
-                    fontWeight: FontWeight.w500,
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ],
-      ),
-      actions: [
-        IconButton(
-          tooltip: 'Mute all students',
-          onPressed: _muteAllStudents,
-          icon: const Icon(Icons.mic_off_rounded, color: yellow, size: 22),
-        ),
-        IconButton(
-          tooltip: 'Minimize classroom',
-          onPressed: () {
-            Get.until((route) => route.isFirst);
-            GlobalAudioOverlayController.showOverlay(
-              context,
-              widget.call,
-              teacherId,
-              "Live Studio",
-              widget.teacherData,
-              widget.enrolledStudents,
-            );
-          },
-          icon: const Icon(Icons.picture_in_picture_alt_rounded, size: 21),
-        ),
-        IconButton(
-          tooltip: isTeacherMuted ? 'Unmute' : 'Mute',
-          onPressed: _toggleTeacherMic,
-          icon: Icon(
-            isTeacherMuted ? Icons.mic_off_rounded : Icons.mic_rounded,
-            color: isTeacherMuted ? yellow : teal,
-            size: 22,
-          ),
-        ),
-        IconButton(
-          tooltip: 'End or leave class',
-          onPressed: () => _showEndClassDialog(context),
-          icon: const Icon(Icons.stop_circle_rounded, color: red, size: 23),
-        ),
-        const SizedBox(width: 7),
-      ],
-    );
+// mm:ss (or h:mm:ss) since a moment; ticks by itself so the screen doesn't rebuild
+class _Elapsed extends StatefulWidget {
+  final DateTime? since;
+  final TextStyle style;
+  const _Elapsed({required this.since, required this.style});
+
+  @override
+  State<_Elapsed> createState() => _ElapsedState();
+}
+
+class _ElapsedState extends State<_Elapsed> {
+  Timer? _t;
+
+  @override
+  void initState() {
+    super.initState();
+    _t = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (mounted) setState(() {});
+    });
   }
 
-  Widget _buildLiveHeader(int studentCount, dynamic speaker, bool desktop) {
-    return Container(
-      width: double.infinity,
-      margin: EdgeInsets.fromLTRB(desktop ? 30 : 14, 16, desktop ? 30 : 14, 10),
-      padding: const EdgeInsets.all(18),
-      decoration: BoxDecoration(
-        gradient: const LinearGradient(
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-          colors: [navy, blue],
-        ),
-        borderRadius: BorderRadius.circular(21),
-      ),
-      child: LayoutBuilder(
-        builder: (context, constraints) {
-          final bool compact = constraints.maxWidth < 600;
-          final status = Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Container(
-                width: 9,
-                height: 9,
-                decoration: const BoxDecoration(
-                  color: teal,
-                  shape: BoxShape.circle,
-                ),
-              ),
-              const SizedBox(width: 7),
-              Text(
-                isTeacherMuted ? 'MIC MUTED' : 'LIVE',
-                style: GoogleFonts.poppins(
-                  color: isTeacherMuted ? yellow : teal,
-                  fontSize: 9.5,
-                  fontWeight: FontWeight.w800,
-                ),
-              ),
-            ],
-          );
-
-          return compact
-              ? Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      children: [
-                        Expanded(child: _headerTitle(studentCount)),
-                        status,
-                      ],
-                    ),
-                    if (speaker != null) ...[
-                      const SizedBox(height: 12),
-                      _speakerPill(speaker.name.toString()),
-                    ],
-                  ],
-                )
-              : Row(
-                  children: [
-                    Expanded(child: _headerTitle(studentCount)),
-                    if (speaker != null) ...[
-                      _speakerPill(speaker.name.toString()),
-                      const SizedBox(width: 18),
-                    ],
-                    status,
-                  ],
-                );
-        },
-      ),
-    );
+  @override
+  void dispose() {
+    _t?.cancel();
+    super.dispose();
   }
 
-  Widget _headerTitle(int studentCount) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Text(
-          'Connected Students',
-          style: GoogleFonts.poppins(
-            color: Colors.white,
-            fontSize: 15,
-            fontWeight: FontWeight.w700,
-          ),
-        ),
-        const SizedBox(height: 2),
-        Text(
-          '$studentCount ${studentCount == 1 ? 'student' : 'students'} in your live classroom',
-          style: GoogleFonts.poppins(
-            color: Colors.white.withOpacity(.68),
-            fontSize: 10.5,
-          ),
-        ),
-      ],
-    );
-  }
-
-  Widget _speakerPill(String name) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
-      decoration: BoxDecoration(
-        color: Colors.white.withOpacity(.10),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: teal.withOpacity(.35)),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          const Icon(Icons.graphic_eq_rounded, color: teal, size: 14),
-          const SizedBox(width: 6),
-          Text(
-            '$name is speaking',
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: GoogleFonts.poppins(
-              color: Colors.white,
-              fontSize: 9.5,
-              fontWeight: FontWeight.w600,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildMobileParticipants(List<dynamic> participants) {
-    return ListView.separated(
-      physics: const BouncingScrollPhysics(),
-      padding: const EdgeInsets.fromLTRB(14, 2, 14, 18),
-      itemCount: participants.length,
-      separatorBuilder: (_, __) => const SizedBox(height: 10),
-      itemBuilder: (context, index) {
-        return _participantCard(participants[index]);
-      },
-    );
-  }
-
-  Widget _buildDesktopParticipants(List<dynamic> participants) {
-    return SingleChildScrollView(
-      physics: const BouncingScrollPhysics(),
-      padding: const EdgeInsets.fromLTRB(30, 2, 30, 22),
-      child: Center(
-        child: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 1150),
-          child: GridView.builder(
-            shrinkWrap: true,
-            physics: const NeverScrollableScrollPhysics(),
-            itemCount: participants.length,
-            gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-              crossAxisCount: 2,
-              crossAxisSpacing: 14,
-              mainAxisSpacing: 14,
-              childAspectRatio: 3.5,
-            ),
-            itemBuilder: (context, index) {
-              return _participantCard(participants[index]);
-            },
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _participantCard(dynamic participant) {
-    final bool muted = !participant.isAudioEnabled;
-    final bool speaking = participant.isSpeaking;
-    final bool teacher = participant.roles.contains('admin');
-
-    final Color avatarColor = speaking
-        ? teal
-        : teacher
-        ? yellow
-        : navy;
-
-    final String name = participant.name.toString().trim().isEmpty
-        ? 'User'
-        : participant.name.toString();
-    final String initial = name[0].toUpperCase();
-
-    final matchedStudent = widget.enrolledStudents.firstWhereOrNull(
-      (s) =>
-          (s['_id']?.toString() == participant.userId) ||
-          (s['name']?.toString().toLowerCase().trim() ==
-              name.toLowerCase().trim()),
-    );
-    final String feeStatus = matchedStudent != null
-        ? (matchedStudent['feeStatus'] ?? 'unpaid').toString().toLowerCase()
-        : 'unpaid';
-    final bool isPaid = feeStatus == 'paid';
-
-    return InkWell(
-      borderRadius: BorderRadius.circular(18),
-      onTap: teacher ? null : () => _kickParticipant(participant),
-      child: AnimatedContainer(
-        duration: const Duration(milliseconds: 180),
-        padding: const EdgeInsets.all(14),
-        decoration: BoxDecoration(
-          color: Colors.white,
-          borderRadius: BorderRadius.circular(18),
-          border: Border.all(
-            color: speaking ? teal.withOpacity(.55) : navy.withOpacity(.09),
-            width: speaking ? 1.5 : 1,
-          ),
-        ),
-        child: Row(
-          children: [
-            CircleAvatar(
-              radius: 22,
-              backgroundColor: avatarColor.withOpacity(.12),
-              child: Text(
-                initial,
-                style: GoogleFonts.poppins(
-                  color: avatarColor,
-                  fontSize: 16,
-                  fontWeight: FontWeight.w800,
-                ),
-              ),
-            ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    children: [
-                      Flexible(
-                        child: Text(
-                          name,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: GoogleFonts.poppins(
-                            color: deepNavy,
-                            fontSize: 12.5,
-                            fontWeight: FontWeight.w700,
-                          ),
-                        ),
-                      ),
-                      if (teacher) ...[
-                        const SizedBox(width: 7),
-                        _tinyBadge('TEACHER', yellow),
-                      ] else ...[
-                        const SizedBox(width: 7),
-                        Container(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 6,
-                            vertical: 2,
-                          ),
-                          decoration: BoxDecoration(
-                            color: isPaid
-                                ? teal.withOpacity(0.12)
-                                : const Color(0xffF7DF55).withOpacity(0.25),
-                            borderRadius: BorderRadius.circular(6),
-                          ),
-                          child: Text(
-                            isPaid ? 'PAID' : 'UNPAID',
-                            style: GoogleFonts.poppins(
-                              color: isPaid ? teal : const Color(0xffB38F00),
-                              fontSize: 7.5,
-                              fontWeight: FontWeight.w800,
-                            ),
-                          ),
-                        ),
-                      ],
-                    ],
-                  ),
-                  const SizedBox(height: 3),
-                  Text(
-                    speaking
-                        ? 'Speaking now'
-                        : muted
-                        ? 'Microphone muted'
-                        : 'Tap to remove student',
-                    style: GoogleFonts.poppins(
-                      color: speaking ? teal : textSecondary,
-                      fontSize: 9.5,
-                      fontWeight: speaking ? FontWeight.w600 : FontWeight.w500,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-            Container(
-              width: 37,
-              height: 37,
-              decoration: BoxDecoration(
-                color: muted ? red.withOpacity(.09) : teal.withOpacity(.10),
-                borderRadius: BorderRadius.circular(11),
-              ),
-              child: Icon(
-                muted ? Icons.mic_off_rounded : Icons.mic_rounded,
-                color: muted ? red : teal,
-                size: 18,
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _tinyBadge(String label, Color color) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
-      decoration: BoxDecoration(
-        color: color.withOpacity(.20),
-        borderRadius: BorderRadius.circular(6),
-      ),
-      child: Text(
-        label,
-        style: GoogleFonts.poppins(
-          color: deepNavy,
-          fontSize: 6.5,
-          fontWeight: FontWeight.w800,
-        ),
-      ),
-    );
-  }
-
-  Widget _buildNoStudents() {
-    return Center(
-      child: Padding(
-        padding: const EdgeInsets.all(24),
-        child: Container(
-          constraints: const BoxConstraints(maxWidth: 420),
-          padding: const EdgeInsets.all(30),
-          decoration: BoxDecoration(
-            color: Colors.white,
-            borderRadius: BorderRadius.circular(24),
-            border: Border.all(color: navy.withOpacity(.08)),
-          ),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Container(
-                width: 72,
-                height: 72,
-                decoration: BoxDecoration(
-                  color: teal.withOpacity(.10),
-                  shape: BoxShape.circle,
-                ),
-                child: const Icon(
-                  Icons.people_outline_rounded,
-                  color: teal,
-                  size: 34,
-                ),
-              ),
-              const SizedBox(height: 16),
-              Text(
-                'Waiting for students',
-                style: GoogleFonts.poppins(
-                  color: deepNavy,
-                  fontSize: 16,
-                  fontWeight: FontWeight.w700,
-                ),
-              ),
-              const SizedBox(height: 6),
-              Text(
-                'Your classroom is live. Students who join will appear here automatically.',
-                textAlign: TextAlign.center,
-                style: GoogleFonts.poppins(
-                  color: textSecondary,
-                  fontSize: 10.5,
-                  height: 1.5,
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildControlBar(BuildContext context, bool desktop, bool tablet) {
-    return Container(
-      padding: EdgeInsets.fromLTRB(
-        desktop ? 30 : 14,
-        13,
-        desktop ? 30 : 14,
-        15,
-      ),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        border: Border(top: BorderSide(color: navy.withOpacity(.10))),
-        boxShadow: [
-          BoxShadow(
-            color: navy.withOpacity(.08),
-            blurRadius: 18,
-            offset: const Offset(0, -5),
-          ),
-        ],
-      ),
-      child: Center(
-        child: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 1150),
-          child: LayoutBuilder(
-            builder: (context, constraints) {
-              final bool compact = constraints.maxWidth < 600;
-              return compact
-                  ? Column(
-                      children: [
-                        _micButton(),
-                        const SizedBox(height: 10),
-                        _muteAllButton(),
-                        const SizedBox(height: 10),
-                        _endButton(context),
-                      ],
-                    )
-                  : Row(
-                      children: [
-                        Expanded(child: _micButton()),
-                        const SizedBox(width: 12),
-                        Expanded(child: _muteAllButton()),
-                        const SizedBox(width: 12),
-                        Expanded(child: _endButton(context)),
-                      ],
-                    );
-            },
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _micButton() {
-    return SizedBox(
-      height: 50,
-      width: double.infinity,
-      child: ElevatedButton.icon(
-        onPressed: _toggleTeacherMic,
-        icon: Icon(
-          isTeacherMuted ? Icons.mic_off_rounded : Icons.mic_rounded,
-          size: 19,
-        ),
-        label: Text(
-          isTeacherMuted ? 'UNMUTE MIC' : 'MUTE MIC',
-          style: GoogleFonts.poppins(
-            fontSize: 11.5,
-            fontWeight: FontWeight.w700,
-          ),
-        ),
-        style: ElevatedButton.styleFrom(
-          backgroundColor: isTeacherMuted ? navy : teal,
-          foregroundColor: Colors.white,
-          elevation: 0,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(13),
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _muteAllButton() {
-    return SizedBox(
-      height: 50,
-      width: double.infinity,
-      child: ElevatedButton.icon(
-        onPressed: _muteAllStudents,
-        icon: const Icon(Icons.mic_off_rounded, size: 19),
-        label: Text(
-          'MUTE ALL',
-          style: GoogleFonts.poppins(
-            fontSize: 11.5,
-            fontWeight: FontWeight.w700,
-          ),
-        ),
-        style: ElevatedButton.styleFrom(
-          backgroundColor: blue,
-          foregroundColor: Colors.white,
-          elevation: 0,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(13),
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _endButton(BuildContext context) {
-    return SizedBox(
-      height: 50,
-      width: double.infinity,
-      child: ElevatedButton.icon(
-        onPressed: () => _showEndClassDialog(context),
-        icon: const Icon(Icons.stop_rounded, size: 19),
-        label: Text(
-          'CLASS OPTIONS',
-          style: GoogleFonts.poppins(
-            fontSize: 11.5,
-            fontWeight: FontWeight.w700,
-          ),
-        ),
-        style: ElevatedButton.styleFrom(
-          backgroundColor: red,
-          foregroundColor: Colors.white,
-          elevation: 0,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(13),
-          ),
-        ),
-      ),
-    );
-  }
-
-  void _showEndClassDialog(BuildContext context) {
-    Get.dialog(
-      Dialog(
-        backgroundColor: Colors.transparent,
-        child: Container(
-          constraints: const BoxConstraints(maxWidth: 430),
-          padding: const EdgeInsets.all(24),
-          decoration: BoxDecoration(
-            color: Colors.white,
-            borderRadius: BorderRadius.circular(24),
-          ),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Container(
-                width: 60,
-                height: 60,
-                decoration: BoxDecoration(
-                  color: red.withOpacity(.10),
-                  shape: BoxShape.circle,
-                ),
-                child: const Icon(
-                  Icons.exit_to_app_rounded,
-                  color: red,
-                  size: 30,
-                ),
-              ),
-              const SizedBox(height: 16),
-              Text(
-                'Classroom Exit Options',
-                style: GoogleFonts.poppins(
-                  color: deepNavy,
-                  fontSize: 18,
-                  fontWeight: FontWeight.w700,
-                ),
-              ),
-              const SizedBox(height: 7),
-              Text(
-                'Choose whether you want to just leave the room or completely end the class for all students.',
-                textAlign: TextAlign.center,
-                style: GoogleFonts.poppins(
-                  color: textSecondary,
-                  fontSize: 11,
-                  height: 1.5,
-                ),
-              ),
-              const SizedBox(height: 22),
-              Column(
-                children: [
-                  SizedBox(
-                    width: double.infinity,
-                    child: OutlinedButton.icon(
-                      onPressed: () {
-                        Get.back();
-                        _leaveClassOnly();
-                      },
-                      icon: const Icon(Icons.logout_rounded, color: navy),
-                      label: Text(
-                        'Leave Class (Students Stay)',
-                        style: GoogleFonts.poppins(
-                          color: navy,
-                          fontSize: 11.5,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                      style: OutlinedButton.styleFrom(
-                        side: BorderSide(color: navy.withOpacity(.28)),
-                        minimumSize: const Size(0, 46),
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(12),
-                        ),
-                      ),
-                    ),
-                  ),
-                  const SizedBox(height: 10),
-                  SizedBox(
-                    width: double.infinity,
-                    child: ElevatedButton.icon(
-                      onPressed: () {
-                        Get.back();
-                        _endClassAndBroadcast(context);
-                      },
-                      icon: const Icon(Icons.stop_circle_rounded),
-                      label: Text(
-                        'End Class for Everyone',
-                        style: GoogleFonts.poppins(
-                          fontSize: 11.5,
-                          fontWeight: FontWeight.w700,
-                        ),
-                      ),
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: red,
-                        foregroundColor: Colors.white,
-                        elevation: 0,
-                        minimumSize: const Size(0, 46),
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(12),
-                        ),
-                      ),
-                    ),
-                  ),
-                  const SizedBox(height: 10),
-                  TextButton(
-                    onPressed: () => Get.back(),
-                    child: Text(
-                      'Cancel',
-                      style: GoogleFonts.poppins(
-                        color: textSecondary,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
+  @override
+  Widget build(BuildContext context) {
+    final since = widget.since;
+    if (since == null) return Text('00:00', style: widget.style);
+    final d = DateTime.now().difference(since);
+    String two(int n) => n.toString().padLeft(2, '0');
+    final text = d.inHours > 0
+        ? '${d.inHours}:${two(d.inMinutes % 60)}:${two(d.inSeconds % 60)}'
+        : '${two(d.inMinutes)}:${two(d.inSeconds % 60)}';
+    return Text(text, style: widget.style);
   }
 }
