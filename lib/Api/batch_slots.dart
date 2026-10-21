@@ -5,7 +5,8 @@ class BatchSlot {
   final String label; // canonical value sent to / stored by the backend
   final String start; // "5:30"
   final String end; // "7:00"
-  final String period; // "AM" | "PM"
+  final String period; // "AM" | "PM" (start)
+  final String? endPeriod; // only when the class ends in the other half (10:30 AM – 12:00 PM)
   final int startMinutes;
 
   const BatchSlot({
@@ -15,10 +16,12 @@ class BatchSlot {
     required this.end,
     required this.period,
     required this.startMinutes,
+    this.endPeriod,
   });
 
-  /// "5:30 – 7:00 AM"
-  String get shortLabel => '$start – $end $period';
+  /// "5:30 – 7:00 AM"   or   "10:30 AM – 12:00 PM"
+  String get shortLabel =>
+      (endPeriod == null || endPeriod == period) ? '$start – $end $period' : '$start $period – $end $endPeriod';
 
   /// "Batch 1"
   String get title => 'Batch $number';
@@ -31,7 +34,7 @@ class BatchSlots {
     BatchSlot(number: 1, label: '05:30 AM - 07:00 AM', start: '5:30', end: '7:00', period: 'AM', startMinutes: 330),
     BatchSlot(number: 2, label: '07:00 AM - 08:30 AM', start: '7:00', end: '8:30', period: 'AM', startMinutes: 420),
     BatchSlot(number: 3, label: '09:00 AM - 10:30 AM', start: '9:00', end: '10:30', period: 'AM', startMinutes: 540),
-    BatchSlot(number: 4, label: '10:30 AM - 12:00 PM', start: '10:30', end: '12:00', period: 'AM', startMinutes: 630),
+    BatchSlot(number: 4, label: '10:30 AM - 12:00 PM', start: '10:30', end: '12:00', period: 'AM', endPeriod: 'PM', startMinutes: 630),
     BatchSlot(number: 5, label: '03:30 PM - 05:00 PM', start: '3:30', end: '5:00', period: 'PM', startMinutes: 930),
     BatchSlot(number: 6, label: '05:00 PM - 06:30 PM', start: '5:00', end: '6:30', period: 'PM', startMinutes: 1020),
     BatchSlot(number: 7, label: '06:30 PM - 08:00 PM', start: '6:30', end: '8:00', period: 'PM', startMinutes: 1110),

@@ -4,10 +4,10 @@ class ApiEndpoints {
   // =====================================================
 
   // 🖥️ LOCAL (laptop running `npm run dev`, phone on same Wi-Fi)
-  static const String baseUrl = "http://192.168.1.3:5000/api";
+ // static const String baseUrl = "http://192.168.1.4:5001/api";
 
   // 🚀 PRODUCTION (Render): uncomment this and comment the LOCAL line above
-  // static const String baseUrl = "https://lets-talk-backend-o06t.onrender.com/api";
+   static const String baseUrl = "https://lets-talk-backend-o06t.onrender.com/api";
 
   // =====================================================
   // Auth Endpoints
@@ -40,7 +40,15 @@ class ApiEndpoints {
   // =====================================================
   static const String practiceMark = "$baseUrl/practice/mark";
   static const String practiceList = "$baseUrl/practice/list";
+  static const String practiceRate = "$baseUrl/practice/rate"; // ⭐ 1–5 after "Mark practiced"
 
-  // Students who joined outside their own batch time (not counted as attendance)
+  // =====================================================
+  // ⏰ Batch timings
+  // =====================================================
+  // Students who joined a different timing than their own
+  // (attendance counts, shown as "joined another timing")
   static const String batchVisitors = "$baseUrl/admin/batch-visitors";
+
+  // Batch-wise summary: per timing → on time / late / absent / other timing
+  static const String batchSummary = "$baseUrl/admin/batch-summary";
 }

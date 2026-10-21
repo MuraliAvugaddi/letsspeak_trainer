@@ -7,12 +7,15 @@ import 'package:http/http.dart' as http;
 import 'package:geolocator/geolocator.dart';
 import 'package:get/get.dart';
 import 'package:stream_video_flutter/stream_video_flutter.dart';
+import 'package:stream_video_flutter/stream_video_flutter.dart' as svf show Priority;
 import 'package:socket_io_client/socket_io_client.dart' as IO;
 import 'package:get_storage/get_storage.dart';
 import 'package:letsspeak_trainer/Api/Apiend_points.dart';
 import 'package:letsspeak_trainer/Api/api_headers.dart';
 import 'package:letsspeak_trainer/Api/batch_slots.dart';
 import 'package:letsspeak_trainer/screens/TeacherLoginScreen.dart';
+import 'package:letsspeak_trainer/screens/AssemblyJoinScreen.dart';
+import 'package:letsspeak_trainer/screens/BestStudentsScreen.dart';
 
 const double instituteLat = 17.729417;
 const double instituteLng = 83.312231;
@@ -85,6 +88,7 @@ class StreamManager {
       _apiKey,
       user: User.regular(userId: userId, name: userName),
       userToken: _token!,
+      options: StreamVideoOptions(logPriority: svf.Priority.warning),
     );
     _cachedUserId = userId;
     return _cachedClient!;
@@ -108,6 +112,7 @@ class StreamManager {
       apiKey,
       user: User.regular(userId: userId, name: userName),
       userToken: token,
+      options: StreamVideoOptions(logPriority: svf.Priority.warning),
     );
     _cachedUserId = userId;
     return _cachedClient!;
@@ -131,6 +136,18 @@ class StreamManager {
     _token = null;
     _tokenAt = null;
   }
+}
+
+/// After a failed join, Stream finishes leaving the call a moment later and
+/// stores the real reason in the call status. Wait for it (max 4 s).
+Future<String> joinFailReason(Call call, Object result) async {
+  var status = "${call.state.value.status}";
+  for (var i = 0; i < 40 && !status.contains('Disconnected'); i++) {
+    await Future.delayed(const Duration(milliseconds: 100));
+    status = "${call.state.value.status}";
+  }
+  final text = "$result\n$status";
+  return text.length > 600 ? text.substring(0, 600) : text;
 }
 
 // =========================================================================
@@ -167,6 +184,7 @@ class ClassroomController {
   final RxList<PracticeEntry> queue = <PracticeEntry>[].obs; // waiting (current not included)
   final RxList<PracticeEntry> done = <PracticeEntry>[].obs; // practiced in this round
   final RxSet<String> practicedToday = <String>{}.obs; // whole day, from the server
+  final RxMap<String, int> ratings = <String, int>{}.obs; // ⭐ studentId → 1..5 (today)
   final Rxn<DateTime> currentSince = Rxn<DateTime>();
   final RxBool saving = false.obs;
 
@@ -176,6 +194,51 @@ class ClassroomController {
 
   bool isOtherBatch(String userId) =>
       otherBatch.any((v) => v['userId']?.toString() == userId);
+
+  // 🔀 SECTION MERGE — other sections sitting in THIS class today
+  // (their attendance + practice are still saved in their own section)
+  final RxList<String> guestSections = <String>[].obs; // ["B", "C"]
+  final RxMap<String, String> mergedFrom = <String, String>{}.obs; // studentId → "B"
+  final RxList<Map<String, dynamic>> guestStudents = <Map<String, dynamic>>[].obs;
+
+  Future<void> loadMerge() async {
+    if (language.toLowerCase() == 'hindi' || section.isEmpty) {
+      guestSections.clear();
+      mergedFrom.clear();
+      guestStudents.clear();
+      return;
+    }
+    try {
+      final res = await http
+          .get(
+            Uri.parse(
+              "${ApiEndpoints.trainerRoster}?stage=$stage&language=$language&section=$section&mode=online&_t=${DateTime.now().millisecondsSinceEpoch}",
+            ),
+            headers: ApiHeaders.auth(),
+          )
+          .timeout(const Duration(seconds: 15));
+      if (res.statusCode != 200) return;
+      final data = jsonDecode(res.body);
+      final merge = data['merge'];
+      final List students = data['students'] ?? [];
+      final guests = students
+          .whereType<Map>()
+          .where((s) => (s['mergedFrom'] ?? '').toString().isNotEmpty)
+          .map((s) => Map<String, dynamic>.from(s))
+          .toList();
+      guestSections.assignAll(
+        merge is Map && merge['guestSections'] is List
+            ? (merge['guestSections'] as List).map((e) => e.toString())
+            : const <String>[],
+      );
+      guestStudents.assignAll(guests);
+      mergedFrom
+        ..clear()
+        ..addAll({for (final g in guests) g['_id'].toString(): g['mergedFrom'].toString()});
+    } catch (e) {
+      debugPrint("Merge info error: $e");
+    }
+  }
 
   StreamSubscription<CallState>? _stateSub;
   Timer? _publishTimer;
@@ -229,14 +292,24 @@ class ClassroomController {
     otherBatch.clear();
     loadOtherBatch();
     _visitorTimer?.cancel();
-    _visitorTimer = Timer.periodic(const Duration(seconds: 45), (_) => loadOtherBatch());
+    guestSections.clear();
+    mergedFrom.clear();
+    guestStudents.clear();
+    loadMerge();
+    _visitorTimer = Timer.periodic(const Duration(seconds: 45), (_) {
+      loadOtherBatch();
+      loadMerge();
+    });
   }
 
   Future<void> loadOtherBatch() async {
     try {
       final res = await http
           .get(
-            Uri.parse("${ApiEndpoints.batchVisitors}?language=$language&stage=$stage"),
+            // Only students of THIS trainer's section (+ merged sections)
+            Uri.parse(
+              "${ApiEndpoints.batchVisitors}?language=$language&stage=$stage&section=${section.isEmpty ? 'all' : section}",
+            ),
             headers: ApiHeaders.auth(),
           )
           .timeout(const Duration(seconds: 15));
@@ -466,6 +539,34 @@ class ClassroomController {
     return false;
   }
 
+  /// ⭐ Trainer's 1–5 rating for today's practice (+ optional quick tags)
+  Future<bool> ratePractice(PracticeEntry e, int rating, List<String> tags) async {
+    try {
+      final res = await http
+          .post(
+            Uri.parse("${ApiEndpoints.baseUrl}/practice/rate"),
+            headers: ApiHeaders.json(),
+            body: jsonEncode({
+              "studentId": e.id,
+              "language": language,
+              "stage": stage,
+              "rating": rating,
+              "tags": tags,
+              "note": tags.join(', '),
+            }),
+          )
+          .timeout(const Duration(seconds: 15));
+      if (res.statusCode == 200) {
+        ratings[e.id] = rating;
+        return true;
+      }
+      debugPrint("Rate failed: ${res.statusCode} ${res.body}");
+    } catch (err) {
+      debugPrint("Rate error: $err");
+    }
+    return false;
+  }
+
   Future<void> loadPracticedToday() async {
     try {
       final res = await http
@@ -482,6 +583,11 @@ class ClassroomController {
         practicedToday
           ..clear()
           ..addAll(records.map((r) => r['userId'].toString()));
+        ratings.clear();
+        for (final r in records) {
+          final v = int.tryParse('${r['rating'] ?? 0}') ?? 0;
+          if (v > 0) ratings[r['userId'].toString()] = v;
+        }
       }
     } catch (e) {
       debugPrint("Load practice error: $e");
@@ -500,18 +606,25 @@ class ClassroomController {
     final cur = current.value;
     final next = queue.isNotEmpty ? queue.first : null;
     try {
+      // ⚠️ Everything is packed into ONE text value. Stream turns empty
+      // lists/strings into null, and ONE null in the call's custom data makes
+      // every join crash in Stream 1.5 ("connect cancelled"). A JSON text is
+      // never empty, so it can never become null.
+      final state = jsonEncode({
+        'micLocked': micLocked.value,
+        'allowed': allowed.toList(),
+        'pActive': practiceActive,
+        'pCurrent': cur?.id ?? '',
+        'pCurrentName': cur?.name ?? '',
+        'pNext': next?.id ?? '',
+        'pNextName': next?.name ?? '',
+        'pQueue': queue.map((e) => e.id).toList(),
+        'pDone': done.length,
+        'pTotal': practiceTotal,
+      });
       final r = await c.update(
         custom: <String, Object>{
-          'micLocked': micLocked.value,
-          'allowed': allowed.toList(),
-          'pActive': practiceActive,
-          'pCurrent': cur?.id ?? '',
-          'pCurrentName': cur?.name ?? '',
-          'pNext': next?.id ?? '',
-          'pNextName': next?.name ?? '',
-          'pQueue': queue.map((e) => e.id).toList(),
-          'pDone': done.length,
-          'pTotal': practiceTotal,
+          'state': state,
           'ts': DateTime.now().millisecondsSinceEpoch,
         },
       );
@@ -1152,6 +1265,30 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
   IO.Socket? _ioSocket;
   Timer? _pollingTimer;
 
+  // 🌐 offline-online day / 🎙 special class — switched by the admin
+  Map<String, dynamic>? _rainMode;
+  Map<String, dynamic>? _assemblyMode;
+
+  // 🔀 today's section merge for this trainer (from the roster)
+  Map<String, dynamic>? _merge;
+  bool _unmerging = false;
+  String? get _mergedIntoHost {
+    final m = _merge?['mergedInto'];
+    return m is Map ? m['hostSection']?.toString() : null;
+  }
+
+  String? get _mergeId {
+    final m = _merge?['mergedInto'];
+    return m is Map ? m['id']?.toString() : null;
+  }
+
+  List<String> get _guestSections {
+    final g = _merge?['guestSections'];
+    return g is List ? g.map((e) => e.toString()).toList() : const [];
+  }
+  bool get _rainOn => _rainMode?['active'] == true;
+  bool get _assemblyOn => _assemblyMode?['active'] == true;
+
   static const Color backgroundColor = Color(0xffE8F2F8);
   static const Color cardColor = Color(0xffFFFFFF);
   static const Color surfaceColor = Color(0xffF5F9FC);
@@ -1173,17 +1310,17 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
 
     // ⚡ Get the class token + Stream connection ready now, so "Start live
     // audio class" only has to join (saves several seconds).
-    if ((widget.teacherData['mode'] ?? 'online').toString().toLowerCase() ==
-        'online') {
-      StreamManager.prewarm(
-        userId: (widget.teacherData['_id'] ?? widget.teacherData['id'] ?? '')
-            .toString(),
-        userName: widget.teacherData['name']?.toString() ?? 'Teacher',
-      );
-    }
+    // (Offline trainers too: online days and the special class are online.)
+    StreamManager.prewarm(
+      userId: (widget.teacherData['_id'] ?? widget.teacherData['id'] ?? '')
+          .toString(),
+      userName: widget.teacherData['name']?.toString() ?? 'Teacher',
+    );
+    _fetchClassMode();
 
     _pollingTimer = Timer.periodic(const Duration(seconds: 10), (_) {
       fetchAssignedStudentsSilent();
+      _fetchClassMode();
     });
   }
 
@@ -1199,6 +1336,27 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
       fetchAssignedStudentsSilent();
+      _fetchClassMode();
+    }
+  }
+
+  Future<void> _fetchClassMode() async {
+    try {
+      final res = await http
+          .get(Uri.parse("${ApiEndpoints.baseUrl}/class-mode"))
+          .timeout(const Duration(seconds: 10));
+      if (res.statusCode != 200 || !mounted) return;
+      final data = jsonDecode(res.body);
+      final rain = data['rain'] is Map ? Map<String, dynamic>.from(data['rain']) : null;
+      final assembly = data['assembly'] is Map ? Map<String, dynamic>.from(data['assembly']) : null;
+      if (jsonEncode(rain) != jsonEncode(_rainMode) || jsonEncode(assembly) != jsonEncode(_assemblyMode)) {
+        setState(() {
+          _rainMode = rain;
+          _assemblyMode = assembly;
+        });
+      }
+    } catch (e) {
+      debugPrint("Class mode error: $e");
     }
   }
 
@@ -1234,8 +1392,114 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
       _ioSocket?.on('attendance_update', (_) {
         fetchAssignedStudentsSilent();
       });
+      // 🔀 admin merged / unmerged sections → roster + live class update instantly
+      _ioSocket?.on('merge_updated', _onMergeUpdated);
+      // admin switched online-day / special class → update instantly (state comes with the event)
+      _ioSocket?.on('class_mode_update', (data) {
+        if (data is Map && data.containsKey('rain') && mounted) {
+          setState(() {
+            _rainMode = data['rain'] is Map ? Map<String, dynamic>.from(data['rain']) : null;
+            _assemblyMode = data['assembly'] is Map ? Map<String, dynamic>.from(data['assembly']) : null;
+          });
+        } else {
+          _fetchClassMode();
+        }
+      });
     } catch (e) {
       debugPrint("Socket error: $e");
+    }
+  }
+
+  void _onMergeUpdated(dynamic data) {
+    if (data is! Map) {
+      fetchAssignedStudentsSilent();
+      return;
+    }
+    final myStage = (widget.teacherData['teacherStage'] ?? widget.teacherData['stage'] ?? 'stage1')
+        .toString()
+        .toLowerCase()
+        .replaceAll(RegExp(r'\s+'), '');
+    final mySection = (widget.teacherData['teacherSection'] ?? widget.teacherData['section'] ?? '')
+        .toString()
+        .toUpperCase();
+    final stage = (data['stage'] ?? '').toString().toLowerCase();
+    final host = (data['hostSection'] ?? '').toString().toUpperCase();
+    final guests = (data['guestSections'] is List ? data['guestSections'] as List : const [])
+        .map((e) => e.toString().toUpperCase())
+        .toList();
+    if (stage != myStage || (host != mySection && !guests.contains(mySection))) return;
+
+    fetchAssignedStudentsSilent();
+    if (ClassroomController.instance.call != null) ClassroomController.instance.loadMerge();
+
+    final merged = data['action'] == 'merged';
+    final iAmHost = host == mySection;
+    final text = iAmHost
+        ? (merged
+            ? 'Section ${guests.join(', ')} joined your class today. Their students are moving in now.'
+            : 'Section ${guests.join(', ')} went back to their own class.')
+        : (merged
+            ? 'Your section is merged into Section $host today. Your students are in Section $host\'s class.'
+            : 'Unmerged — Section $mySection is your own class again. Start your class.');
+    Get.snackbar(
+      merged ? 'Section merge' : 'Section unmerged',
+      text,
+      backgroundColor: merged ? brandNavy : accentGreen,
+      colorText: Colors.white,
+      icon: const Icon(Icons.merge_type_rounded, color: Colors.white),
+      duration: const Duration(seconds: 5),
+      margin: const EdgeInsets.all(14),
+    );
+  }
+
+  /// Section B's trainer is back → ends the merge, students go back to B
+  Future<void> _unmergeMine() async {
+    final id = _mergeId;
+    final host = _mergedIntoHost;
+    if (id == null || _unmerging) return;
+    final ok = await Get.dialog<bool>(
+      AlertDialog(
+        backgroundColor: Colors.white,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+        title: Text("I'm back — unmerge?",
+            style: GoogleFonts.poppins(color: textPrimary, fontWeight: FontWeight.w700, fontSize: 16)),
+        content: Text(
+          'Your students leave Section $host\'s class and come back to yours. Start your live class right after.',
+          style: GoogleFonts.poppins(color: textSecondary, fontSize: 12.5, height: 1.45),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Get.back(result: false),
+            child: Text('Not now', style: GoogleFonts.poppins(color: textSecondary, fontWeight: FontWeight.w600)),
+          ),
+          ElevatedButton(
+            onPressed: () => Get.back(result: true),
+            style: ElevatedButton.styleFrom(backgroundColor: brandNavy, foregroundColor: Colors.white, elevation: 0),
+            child: Text('Unmerge', style: GoogleFonts.poppins(fontWeight: FontWeight.w700)),
+          ),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    setState(() => _unmerging = true);
+    try {
+      final res = await http.delete(
+        Uri.parse("${ApiEndpoints.baseUrl}/admin/section-merges/$id"),
+        headers: ApiHeaders.auth(),
+      );
+      if (res.statusCode == 200) {
+        await fetchAssignedStudentsSilent();
+      } else {
+        String msg = 'Could not unmerge (${res.statusCode}).';
+        try {
+          msg = (jsonDecode(res.body)['message'] ?? msg).toString();
+        } catch (_) {}
+        Get.snackbar('Not unmerged', msg, backgroundColor: accentRed, colorText: Colors.white, margin: const EdgeInsets.all(14));
+      }
+    } catch (e) {
+      Get.snackbar('Connection error', '$e', backgroundColor: accentRed, colorText: Colors.white, margin: const EdgeInsets.all(14));
+    } finally {
+      if (mounted) setState(() => _unmerging = false);
     }
   }
 
@@ -1281,6 +1545,7 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
 
         if (mounted) {
           setState(() {
+            _merge = data['merge'] is Map ? Map<String, dynamic>.from(data['merge']) : null;
             allAssignedStudents = students.where((s) {
               final role = (s['role'] ?? 'student').toString().toLowerCase();
               return role == 'student';
@@ -1424,43 +1689,35 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
       final client = results[0] as StreamVideo;
       final callId = results[1] as String;
 
-      // ⚡ Fast path: one join() call (creates the call + mic on)
-      var call = client.makeCall(
+      // load the call → join → turn the mic on (Stream 1.5 order)
+      final call = client.makeCall(
         callType: StreamCallType.defaultType(),
         id: callId,
       );
-      var joined = await call.join(
-        connectOptions: CallConnectOptions(microphone: TrackOption.enabled()),
-      );
+      final loaded = await call.getOrCreate();
+      if (loaded.isFailure) debugPrint("getOrCreate failed: $loaded");
 
+      // Stream retries 3 times inside join(). No extra retry here, so the
+      // REAL reason is not overwritten.
+      // 🎧 AUDIO ONLY: camera off from the start → Chrome/phone never asks
+      // for camera permission, only the microphone.
+      final joined = await call.join(
+        connectOptions: CallConnectOptions(
+          camera: TrackOption.disabled(),
+          microphone: TrackOption.enabled(),
+        ),
+      );
       if (joined.isFailure) {
-        debugPrint("Fast join failed: $joined");
-        // 🛟 Safe path (the old, proven way): fresh connection → getOrCreate → join → mic
-        try {
-          await call.leave();
-        } catch (_) {}
-        await StreamManager.reset();
-        final fresh = await StreamManager.clientFor(
-          userId: teacherId,
-          userName: teacherName,
-        );
-        call = fresh.makeCall(
-          callType: StreamCallType.defaultType(),
-          id: callId,
-        );
-        joined = await call.join();
-        if (joined.isFailure) {
-          debugPrint("Safe join failed: $joined");
-          final reason = "${call.state.value.status}";
-          throw Exception(
-            "Could not connect to the classroom.\n${reason.length > 300 ? reason.substring(0, 300) : reason}",
-          );
-        }
-        try {
-          await call.setMicrophoneEnabled(enabled: true);
-        } catch (e) {
-          debugPrint("Mic Error: $e");
-        }
+        final reason = await joinFailReason(call, joined);
+        debugPrint("❌ JOIN FAILED: $reason");
+        throw Exception("Could not connect to the classroom.\n$reason");
+      }
+
+      try {
+        await call.setCameraEnabled(enabled: false); // audio class: never video
+        await call.setMicrophoneEnabled(enabled: true);
+      } catch (e) {
+        debugPrint("Mic Error: $e");
       }
 
       ClassroomController.instance.begin(
@@ -1502,7 +1759,7 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
         e.toString().replaceFirst('Exception: ', ''),
         backgroundColor: accentRed,
         colorText: Colors.white,
-        duration: const Duration(seconds: 6),
+        duration: const Duration(seconds: 12),
       );
     } finally {
       if (mounted) setState(() => isStartingBroadcast = false);
@@ -1537,6 +1794,10 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
     }
     if (res.statusCode == 401) {
       throw Exception("Session expired. Please log out and log in again.");
+    }
+    if (data is Map && data['merged'] == true) {
+      fetchAssignedStudentsSilent(); // show the "merged" card
+      throw Exception((data['error'] ?? 'Your section is merged into another section today.').toString());
     }
     throw Exception(
       "Server could not create the class: ${data['error'] ?? res.statusCode}",
@@ -1699,7 +1960,7 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
                           children: [
                             Expanded(
                               flex: 6,
-                              child: _buildLiveClassCard(isOnline),
+                              child: _buildClassArea(isOnline),
                             ),
                             const SizedBox(width: 18),
                             Expanded(
@@ -1715,7 +1976,7 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
                           ],
                         )
                       else ...[
-                        _buildLiveClassCard(isOnline),
+                        _buildClassArea(isOnline),
                         const SizedBox(height: 16),
                         _buildOverviewCard(
                           totalCount,
@@ -1831,6 +2092,13 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
         ],
       ),
       actions: [
+        // 🏆 best students of the month (students only)
+        IconButton(
+          tooltip: 'Best students',
+          onPressed: () => Get.to(() => const BestStudentsScreen()),
+          icon: const Icon(Icons.emoji_events_rounded),
+          color: const Color(0xffE3B21B),
+        ),
         IconButton(
           tooltip: 'Refresh students',
           onPressed: fetchAssignedStudentsSilent,
@@ -1846,6 +2114,219 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
         ),
         const SizedBox(width: 8),
       ],
+    );
+  }
+
+  // Normal class card, or 🎙 special class / 🌐 offline-online day versions
+  Widget _buildClassArea(bool isOnline) {
+    if (_assemblyOn) return _buildAssemblyCard();
+    if (!isOnline && _rainOn) {
+      return Column(
+        children: [
+          _buildRainBanner(),
+          const SizedBox(height: 10),
+          _buildLiveClassCard(true), // offline trainer teaches ONLINE today
+        ],
+      );
+    }
+    // 🔀 section merge (English online)
+    if (_mergedIntoHost != null) return _buildMergedAwayCard();
+    if (_guestSections.isNotEmpty) {
+      return Column(
+        children: [
+          _buildHostMergeBanner(),
+          const SizedBox(height: 10),
+          _buildLiveClassCard(isOnline),
+        ],
+      );
+    }
+    return _buildLiveClassCard(isOnline);
+  }
+
+  /// This trainer's section is merged into another section today
+  Widget _buildMergedAwayCard() {
+    final host = _mergedIntoHost ?? '';
+    final mySection = (widget.teacherData['teacherSection'] ?? widget.teacherData['section'] ?? '').toString().toUpperCase();
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(20),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: const Color(0xffF3D58A)),
+        boxShadow: [BoxShadow(color: Colors.black.withOpacity(.035), blurRadius: 18, offset: const Offset(0, 6))],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                width: 44,
+                height: 44,
+                decoration: BoxDecoration(color: const Color(0xffFFF4D5), borderRadius: BorderRadius.circular(13)),
+                child: const Icon(Icons.merge_type_rounded, color: Color(0xffC78B00)),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text('Section $mySection is merged into Section $host',
+                        style: GoogleFonts.poppins(color: brandNavy, fontSize: 15, fontWeight: FontWeight.w700)),
+                    const SizedBox(height: 2),
+                    Text(
+                      'Your students are in Section $host\'s class today. Their attendance & practice are still saved in Section $mySection.',
+                      style: GoogleFonts.poppins(color: const Color(0xff71859A), fontSize: 11.5, height: 1.4),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 18),
+          SizedBox(
+            width: double.infinity,
+            height: 50,
+            child: ElevatedButton.icon(
+              onPressed: _unmerging ? null : _unmergeMine,
+              icon: _unmerging
+                  ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2))
+                  : const Icon(Icons.call_split_rounded),
+              label: Text(_unmerging ? 'Unmerging…' : "I'm back — unmerge",
+                  style: GoogleFonts.poppins(fontSize: 13.5, fontWeight: FontWeight.w700)),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: brandNavy,
+                foregroundColor: Colors.white,
+                elevation: 0,
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Other sections joined this trainer's class today
+  Widget _buildHostMergeBanner() {
+    final guests = _guestSections;
+    final count = allAssignedStudents.where((s) => (s['mergedFrom'] ?? '').toString().isNotEmpty).length;
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
+      decoration: BoxDecoration(
+        color: const Color(0xffF1EDFF),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: const Color(0xff7A5AF8).withOpacity(.30)),
+      ),
+      child: Row(
+        children: [
+          const Icon(Icons.merge_type_rounded, color: Color(0xff7A5AF8), size: 22),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              'Section ${guests.join(', ')} ${guests.length > 1 ? 'are' : 'is'} merged into your class today • $count student${count == 1 ? '' : 's'}. '
+              'Do their practice & rating as usual — it is saved in their own section.',
+              style: GoogleFonts.poppins(color: const Color(0xff4A3AA8), fontSize: 11.5, fontWeight: FontWeight.w600, height: 1.4),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildRainBanner() {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
+      decoration: BoxDecoration(
+        color: brandBlue.withOpacity(.10),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: brandBlue.withOpacity(.30)),
+      ),
+      child: Row(
+        children: [
+          const Text('🌐', style: TextStyle(fontSize: 24)),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              '${(_rainMode?['note'] ?? '').toString().isNotEmpty ? 'Reason: ${_rainMode?['note']}\n' : ''}Today your offline class is ONLINE (set by admin). Start the live audio class — your offline students join from their app. Attendance is online today.',
+              style: GoogleFonts.poppins(color: brandNavy, fontSize: 11.5, fontWeight: FontWeight.w600, height: 1.4),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildAssemblyCard() {
+    final rawTitle = (_assemblyMode?['title'] ?? '').toString().trim();
+    final title = rawTitle.isEmpty ? 'Surendra Sir Special Class' : rawTitle;
+    final time = (_assemblyMode?['startTime'] ?? '').toString();
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(20),
+      decoration: BoxDecoration(
+        gradient: const LinearGradient(colors: [Color(0xFF7B2FF7), Color(0xFFD6336C)]),
+        borderRadius: BorderRadius.circular(20),
+        boxShadow: [BoxShadow(color: const Color(0xFFD6336C).withOpacity(.25), blurRadius: 18, offset: const Offset(0, 6))],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                width: 44,
+                height: 44,
+                decoration: BoxDecoration(color: Colors.white.withOpacity(.18), borderRadius: BorderRadius.circular(13)),
+                child: const Icon(Icons.record_voice_over_rounded, color: Colors.white),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(title,
+                        style: GoogleFonts.poppins(color: Colors.white, fontSize: 15, fontWeight: FontWeight.w800)),
+                    Text(
+                      'Today${time.isNotEmpty ? ' at $time' : ''} • all students & trainers in one class',
+                      style: GoogleFonts.poppins(color: Colors.white.withOpacity(.85), fontSize: 11.5),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          Text(
+            'Normal classes are paused while the special class is on. Join — your attendance is marked. You can talk when Sir opens the mics.',
+            style: GoogleFonts.poppins(color: Colors.white.withOpacity(.9), fontSize: 11, height: 1.4),
+          ),
+          const SizedBox(height: 16),
+          SizedBox(
+            width: double.infinity,
+            height: 50,
+            child: ElevatedButton.icon(
+              onPressed: () => Get.to(() => AssemblyJoinScreen(
+                    teacherData: widget.teacherData,
+                    title: title,
+                    startTime: time,
+                  )),
+              icon: const Icon(Icons.headphones_rounded, size: 20),
+              label: Text('Join special class',
+                  style: GoogleFonts.poppins(fontWeight: FontWeight.w800, fontSize: 13)),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.white,
+                foregroundColor: const Color(0xFF7B2FF7),
+                elevation: 0,
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(13)),
+              ),
+            ),
+          ),
+        ],
+      ),
     );
   }
 
@@ -2405,11 +2886,12 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
                 fontSize: 11,
               ),
               headingRowColor: const WidgetStatePropertyAll(Color(0xffF9FAFB)),
-              columns: const [
-                DataColumn(label: Text('STUDENT')),
-                DataColumn(label: Text('TIMING')),
-                DataColumn(label: Text('ATTENDANCE')),
-                DataColumn(label: Text('PAYMENT')),
+              columns: [
+                const DataColumn(label: Text('STUDENT')),
+                const DataColumn(label: Text('TIMING')),
+                const DataColumn(label: Text('ATTENDANCE')),
+                const DataColumn(label: Text('PAYMENT')),
+                if (_isOfflineTrainer) const DataColumn(label: Text('PRACTICE ⭐')),
               ],
               rows: students.map((student) {
                 final String name =
@@ -2434,15 +2916,30 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
                           const SizedBox(width: 10),
                           SizedBox(
                             width: 170,
-                            child: Text(
-                              name,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: GoogleFonts.poppins(
-                                color: brandNavy,
-                                fontSize: 11.5,
-                                fontWeight: FontWeight.w700,
-                              ),
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  name,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: GoogleFonts.poppins(
+                                    color: brandNavy,
+                                    fontSize: 11.5,
+                                    fontWeight: FontWeight.w700,
+                                  ),
+                                ),
+                                if ((student['mergedFrom'] ?? '').toString().isNotEmpty)
+                                  Text(
+                                    'From Section ${student['mergedFrom']}',
+                                    style: GoogleFonts.poppins(
+                                      color: const Color(0xff7A5AF8),
+                                      fontSize: 9.5,
+                                      fontWeight: FontWeight.w700,
+                                    ),
+                                  ),
+                              ],
                             ),
                           ),
                         ],
@@ -2468,6 +2965,7 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
                         paid ? accentGreen : const Color(0xffD5A800),
                       ),
                     ),
+                    if (_isOfflineTrainer) DataCell(_practiceAction(student)),
                   ],
                 );
               }).toList(),
@@ -2523,6 +3021,8 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
                       spacing: 6,
                       runSpacing: 5,
                       children: [
+                        if ((student['mergedFrom'] ?? '').toString().isNotEmpty)
+                          _statusBadge('From Sec ${student['mergedFrom']}', const Color(0xff7A5AF8)),
                         _statusBadge(
                           BatchSlots.shortOf(student['batchTime'], fallback: 'No timing'),
                           brandBlue,
@@ -2540,12 +3040,265 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
                   ],
                 ),
               ),
-              const Icon(Icons.chevron_right_rounded, color: Color(0xff98A2B3)),
+              if (_isOfflineTrainer)
+                _practiceAction(student, compact: true)
+              else
+                const Icon(Icons.chevron_right_rounded, color: Color(0xff98A2B3)),
             ],
           ),
         );
       }).toList(),
     );
+  }
+
+  // =====================================================================
+  // ⭐ OFFLINE TRAINER: practice done + rating for each student (after class)
+  // =====================================================================
+  bool get _isOfflineTrainer =>
+      (widget.teacherData['mode'] ?? 'online').toString().toLowerCase() == 'offline';
+  String get _trainerLanguage => widget.teacherData['language']?.toString() ?? 'English';
+  String get _trainerStage => (widget.teacherData['teacherStage'] ?? widget.teacherData['stage'] ?? 'stage1')
+      .toString()
+      .toLowerCase()
+      .replaceAll(RegExp(r'\s+'), '');
+
+  static const List<String> _practiceTags = [
+    'Fluency',
+    'Pronunciation',
+    'Grammar',
+    'Vocabulary',
+    'Confidence',
+    'Needs practice',
+  ];
+
+  Widget _practiceAction(dynamic student, {bool compact = false}) {
+    final bool done = student['practiced'] == true;
+    final int rating = int.tryParse('${student['practiceRating'] ?? 0}') ?? 0;
+    if (done) {
+      return Tooltip(
+        message: 'Tap to change rating • long-press to undo',
+        child: InkWell(
+          borderRadius: BorderRadius.circular(10),
+          onTap: () => _openPracticeSheet(student),
+          onLongPress: () => _undoPractice(student),
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 6),
+            decoration: BoxDecoration(
+              color: accentGreen.withOpacity(.12),
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: accentGreen.withOpacity(.4)),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(Icons.check_circle_rounded, size: 14, color: accentGreen),
+                const SizedBox(width: 4),
+                Text(rating > 0 ? '★$rating' : (compact ? 'Done' : 'Practiced'),
+                    style: GoogleFonts.poppins(color: accentGreen, fontSize: 10.5, fontWeight: FontWeight.w800)),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
+    return SizedBox(
+      height: 32,
+      child: OutlinedButton.icon(
+        onPressed: () => _openPracticeSheet(student),
+        icon: const Icon(Icons.star_border_rounded, size: 15),
+        label: Text(compact ? 'Rate' : 'Practice',
+            style: GoogleFonts.poppins(fontSize: 10.5, fontWeight: FontWeight.w700)),
+        style: OutlinedButton.styleFrom(
+          foregroundColor: brandNavy,
+          padding: const EdgeInsets.symmetric(horizontal: 9),
+          side: BorderSide(color: brandNavy.withOpacity(.3)),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+        ),
+      ),
+    );
+  }
+
+  void _openPracticeSheet(dynamic student) {
+    final String name = (student['name'] ?? 'Student').toString();
+    int rating = int.tryParse('${student['practiceRating'] ?? 0}') ?? 0;
+    final Set<String> tags = <String>{};
+    bool saving = false;
+    const labels = ['', 'Needs work', 'Okay', 'Good', 'Very good', 'Excellent'];
+
+    Get.bottomSheet(
+      StatefulBuilder(
+        builder: (context, setSheet) => Container(
+          padding: const EdgeInsets.fromLTRB(20, 14, 20, 18),
+          decoration: const BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.vertical(top: Radius.circular(22)),
+          ),
+          child: SafeArea(
+            top: false,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Center(
+                  child: Container(
+                    width: 38,
+                    height: 4,
+                    decoration: BoxDecoration(color: const Color(0xffD4E2EC), borderRadius: BorderRadius.circular(4)),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                Text('How did $name do today?',
+                    style: GoogleFonts.poppins(color: textPrimary, fontSize: 16, fontWeight: FontWeight.w800)),
+                Text('Offline class • speaking practice',
+                    style: GoogleFonts.poppins(color: textSecondary, fontSize: 11)),
+                const SizedBox(height: 12),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: List.generate(5, (i) {
+                    final v = i + 1;
+                    return IconButton(
+                      onPressed: () => setSheet(() => rating = v),
+                      icon: Icon(v <= rating ? Icons.star_rounded : Icons.star_outline_rounded,
+                          color: const Color(0xffE3B21B), size: 36),
+                    );
+                  }),
+                ),
+                Center(
+                  child: Text(rating == 0 ? 'Tap the stars' : labels[rating],
+                      style: GoogleFonts.poppins(color: brandNavy, fontSize: 12.5, fontWeight: FontWeight.w700)),
+                ),
+                const SizedBox(height: 12),
+                Wrap(
+                  spacing: 6,
+                  runSpacing: 6,
+                  children: _practiceTags
+                      .map((t) => ChoiceChip(
+                            label: Text(t, style: GoogleFonts.poppins(fontSize: 11)),
+                            selected: tags.contains(t),
+                            selectedColor: accentGreen.withOpacity(.2),
+                            onSelected: (v) => setSheet(() => v ? tags.add(t) : tags.remove(t)),
+                          ))
+                      .toList(),
+                ),
+                const SizedBox(height: 16),
+                Row(
+                  children: [
+                    Expanded(
+                      child: OutlinedButton(
+                        onPressed: saving
+                            ? null
+                            : () async {
+                                setSheet(() => saving = true);
+                                final ok = await _saveOfflinePractice(student, 0, const {});
+                                if (ok) Get.back();
+                                setSheet(() => saving = false);
+                              },
+                        style: OutlinedButton.styleFrom(
+                          minimumSize: const Size(0, 46),
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                        ),
+                        child: Text('Practiced, no rating',
+                            style: GoogleFonts.poppins(fontSize: 11.5, fontWeight: FontWeight.w700, color: brandNavy)),
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: ElevatedButton(
+                        onPressed: (saving || rating == 0)
+                            ? null
+                            : () async {
+                                setSheet(() => saving = true);
+                                final ok = await _saveOfflinePractice(student, rating, tags);
+                                if (ok) Get.back();
+                                setSheet(() => saving = false);
+                              },
+                        style: ElevatedButton.styleFrom(
+                          minimumSize: const Size(0, 46),
+                          backgroundColor: accentGreen,
+                          foregroundColor: Colors.white,
+                          elevation: 0,
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                        ),
+                        child: saving
+                            ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                            : Text('Save rating', style: GoogleFonts.poppins(fontSize: 12, fontWeight: FontWeight.w800)),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+      isScrollControlled: true,
+    );
+  }
+
+  Future<bool> _saveOfflinePractice(dynamic student, int rating, Set<String> tags) async {
+    final String studentId = (student['_id'] ?? student['id'] ?? '').toString();
+    try {
+      final mark = await http.post(
+        Uri.parse("${ApiEndpoints.baseUrl}/practice/mark"),
+        headers: ApiHeaders.json(),
+        body: jsonEncode({
+          "studentId": studentId,
+          "studentName": student['name']?.toString() ?? '',
+          "language": _trainerLanguage,
+          "stage": _trainerStage,
+          "section": "",
+          "practiced": true,
+          if (rating > 0) "rating": rating,
+        }),
+      );
+      if (mark.statusCode != 200) throw Exception('mark ${mark.statusCode}');
+      if (rating > 0) {
+        await http.post(
+          Uri.parse("${ApiEndpoints.baseUrl}/practice/rate"),
+          headers: ApiHeaders.json(),
+          body: jsonEncode({
+            "studentId": studentId,
+            "language": _trainerLanguage,
+            "stage": _trainerStage,
+            "rating": rating,
+            "tags": tags.toList(),
+          }),
+        );
+      }
+      Get.snackbar('Saved', rating > 0 ? '${student['name']} • ★$rating' : '${student['name']} marked practiced',
+          backgroundColor: accentGreen, colorText: Colors.white, snackPosition: SnackPosition.BOTTOM);
+      fetchAssignedStudentsSilent();
+      return true;
+    } catch (e) {
+      Get.snackbar('Not saved', 'Could not save practice. Try again.',
+          backgroundColor: accentRed, colorText: Colors.white, snackPosition: SnackPosition.BOTTOM);
+      return false;
+    }
+  }
+
+  Future<void> _undoPractice(dynamic student) async {
+    final ok = await Get.dialog<bool>(AlertDialog(
+      title: Text('Undo practice?', style: GoogleFonts.poppins(fontWeight: FontWeight.w700)),
+      content: Text('Remove today\'s practice and rating for ${student['name']}?', style: GoogleFonts.poppins(fontSize: 13)),
+      actions: [
+        TextButton(onPressed: () => Get.back(result: false), child: const Text('Cancel')),
+        TextButton(onPressed: () => Get.back(result: true), child: const Text('Undo', style: TextStyle(color: accentRed))),
+      ],
+    ));
+    if (ok != true) return;
+    try {
+      await http.post(
+        Uri.parse("${ApiEndpoints.baseUrl}/practice/mark"),
+        headers: ApiHeaders.json(),
+        body: jsonEncode({
+          "studentId": (student['_id'] ?? student['id'] ?? '').toString(),
+          "language": _trainerLanguage,
+          "stage": _trainerStage,
+          "practiced": false,
+        }),
+      );
+      fetchAssignedStudentsSilent();
+    } catch (_) {}
   }
 
   Widget _studentAvatar(String name, {double radius = 19}) {
@@ -2771,10 +3524,12 @@ class _TeacherBroadcastScreenState extends State<TeacherBroadcastScreen> {
   Map<String, dynamic>? _enrolled(CallParticipantState p) {
     final name = _nameOf(p).toLowerCase();
     final match = widget.enrolledStudents.firstWhereOrNull(
-      (s) =>
-          s['_id']?.toString() == p.userId ||
-          s['name']?.toString().toLowerCase().trim() == name,
-    );
+          (s) =>
+              s['_id']?.toString() == p.userId ||
+              s['name']?.toString().toLowerCase().trim() == name,
+        ) ??
+        // 🔀 merged-in students (Section B in Section A's class today)
+        cc.guestStudents.firstWhereOrNull((s) => s['_id']?.toString() == p.userId);
     return match is Map<String, dynamic> ? match : null;
   }
 
@@ -2859,7 +3614,8 @@ class _TeacherBroadcastScreenState extends State<TeacherBroadcastScreen> {
   }
 
   Future<void> _markPracticed() async {
-    final name = cc.current.value?.name ?? '';
+    final PracticeEntry? entry = cc.current.value;
+    final name = entry?.name ?? '';
     HapticFeedback.mediumImpact();
     final ok = await cc.markCurrentPracticed();
     if (!ok) {
@@ -2875,6 +3631,169 @@ class _TeacherBroadcastScreenState extends State<TeacherBroadcastScreen> {
       next != null ? '$name practiced ✓  Now: ${next.name}' : '$name practiced ✓',
       color: green,
       icon: Icons.check_circle_rounded,
+    );
+    if (entry != null) _askRating(entry);
+  }
+
+  // ⭐ After "Mark practiced": how did the student do? (1–5 stars + quick tags)
+  // Admin sees it daily; it counts 30% in "Best student of the month".
+  void _askRating(PracticeEntry e) {
+    int stars = cc.ratings[e.id] ?? 0;
+    final Set<String> picked = <String>{};
+    const tags = ['Fluency', 'Pronunciation', 'Grammar', 'Vocabulary', 'Confidence', 'Needs practice'];
+    const labels = ['', 'Needs work', 'Fair', 'Good', 'Very good', 'Excellent'];
+    bool saving = false;
+
+    Get.bottomSheet(
+      StatefulBuilder(
+        builder: (context, setSheet) {
+          return Container(
+            padding: const EdgeInsets.fromLTRB(20, 12, 20, 20),
+            decoration: const BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+            ),
+            child: SafeArea(
+              top: false,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Container(
+                    width: 40,
+                    height: 4,
+                    decoration: BoxDecoration(
+                      color: border,
+                      borderRadius: BorderRadius.circular(4),
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+                  Text(
+                    'How did ${e.name} do?',
+                    textAlign: TextAlign.center,
+                    style: GoogleFonts.poppins(
+                      color: textDark,
+                      fontSize: 16,
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    'Rate today\'s speaking practice',
+                    style: GoogleFonts.poppins(color: textSecondary, fontSize: 11),
+                  ),
+                  const SizedBox(height: 12),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: List.generate(5, (i) {
+                      final on = i < stars;
+                      return IconButton(
+                        iconSize: 38,
+                        padding: const EdgeInsets.symmetric(horizontal: 2),
+                        constraints: const BoxConstraints(),
+                        onPressed: () {
+                          HapticFeedback.selectionClick();
+                          setSheet(() => stars = i + 1);
+                        },
+                        icon: Icon(
+                          on ? Icons.star_rounded : Icons.star_outline_rounded,
+                          color: on ? const Color(0xFFF5B83D) : border,
+                        ),
+                      );
+                    }),
+                  ),
+                  SizedBox(
+                    height: 20,
+                    child: Text(
+                      labels[stars],
+                      style: GoogleFonts.poppins(
+                        color: amber,
+                        fontSize: 12,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Wrap(
+                    spacing: 7,
+                    runSpacing: 7,
+                    alignment: WrapAlignment.center,
+                    children: tags.map((t) {
+                      final sel = picked.contains(t);
+                      return ChoiceChip(
+                        label: Text(
+                          t,
+                          style: GoogleFonts.poppins(
+                            fontSize: 11,
+                            fontWeight: FontWeight.w600,
+                            color: sel ? Colors.white : textDark,
+                          ),
+                        ),
+                        selected: sel,
+                        selectedColor: navy,
+                        backgroundColor: background,
+                        showCheckmark: false,
+                        onSelected: (_) => setSheet(() {
+                          sel ? picked.remove(t) : picked.add(t);
+                        }),
+                      );
+                    }).toList(),
+                  ),
+                  const SizedBox(height: 16),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: TextButton(
+                          onPressed: saving ? null : () => Get.back(),
+                          child: Text(
+                            'Skip',
+                            style: GoogleFonts.poppins(
+                              color: textSecondary,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        flex: 2,
+                        child: ElevatedButton(
+                          onPressed: stars == 0 || saving
+                              ? null
+                              : () async {
+                                  setSheet(() => saving = true);
+                                  final ok = await cc.ratePractice(e, stars, picked.toList());
+                                  if (Get.isBottomSheetOpen == true) Get.back();
+                                  _toast(
+                                    ok ? '${e.name}: ${'★' * stars} saved' : 'Rating not saved — check internet',
+                                    color: ok ? green : red,
+                                    icon: ok ? Icons.star_rounded : Icons.wifi_off_rounded,
+                                  );
+                                },
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: navy,
+                            foregroundColor: Colors.white,
+                            disabledBackgroundColor: navy.withOpacity(.35),
+                            minimumSize: const Size(0, 48),
+                            elevation: 0,
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(14),
+                            ),
+                          ),
+                          child: Text(
+                            saving ? 'Saving…' : 'Save rating',
+                            style: GoogleFonts.poppins(fontWeight: FontWeight.w800),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          );
+        },
+      ),
+      isScrollControlled: true,
     );
   }
 
@@ -2979,6 +3898,7 @@ class _TeacherBroadcastScreenState extends State<TeacherBroadcastScreen> {
                   child: Column(
                     children: [
                       _liveStrip(students.length, speaker),
+                      Obx(() => _mergeBar()),
                       Obx(() => _micLockBar()),
                       _tabBar(students.length),
                       Expanded(
@@ -3185,6 +4105,35 @@ class _TeacherBroadcastScreenState extends State<TeacherBroadcastScreen> {
                         ],
                       ),
                     ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // 🔀 Sections merged into this class today
+  Widget _mergeBar() {
+    final guests = cc.guestSections.toList();
+    if (guests.isEmpty) return const SizedBox.shrink();
+    final n = cc.guestStudents.length;
+    return Container(
+      width: double.infinity,
+      margin: const EdgeInsets.fromLTRB(14, 8, 14, 0),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      decoration: BoxDecoration(
+        color: const Color(0xffF1EDFF),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: const Color(0xff7A5AF8).withOpacity(.3)),
+      ),
+      child: Row(
+        children: [
+          const Icon(Icons.merge_type_rounded, size: 16, color: Color(0xff7A5AF8)),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              'Section ${guests.join(', ')} merged in • $n student${n == 1 ? '' : 's'} (badge on their photo). Practice is saved in their own section.',
+              style: GoogleFonts.poppins(color: const Color(0xff4A3AA8), fontSize: 10.5, fontWeight: FontWeight.w600),
             ),
           ),
         ],
@@ -3824,22 +4773,35 @@ class _TeacherBroadcastScreenState extends State<TeacherBroadcastScreen> {
           Row(
             children: [
               Expanded(
-                child: OutlinedButton.icon(
+                // Icon + text inside a FittedBox: never wraps or overflows
+                child: OutlinedButton(
                   onPressed: saving ? null : cc.skipCurrent,
-                  icon: const Icon(Icons.skip_next_rounded, size: 18),
-                  label: Text(
-                    'Later',
-                    style: GoogleFonts.poppins(
-                      fontSize: 12,
-                      fontWeight: FontWeight.w700,
-                    ),
-                  ),
                   style: OutlinedButton.styleFrom(
                     foregroundColor: Colors.white,
                     side: BorderSide(color: Colors.white.withOpacity(.45)),
                     minimumSize: const Size(0, 48),
+                    padding: const EdgeInsets.symmetric(horizontal: 8),
                     shape: RoundedRectangleBorder(
                       borderRadius: BorderRadius.circular(14),
+                    ),
+                  ),
+                  child: FittedBox(
+                    fit: BoxFit.scaleDown,
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const Icon(Icons.skip_next_rounded, size: 18),
+                        const SizedBox(width: 6),
+                        Text(
+                          'Later',
+                          maxLines: 1,
+                          softWrap: false,
+                          style: GoogleFonts.poppins(
+                            fontSize: 13,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      ],
                     ),
                   ),
                 ),
@@ -3861,6 +4823,9 @@ class _TeacherBroadcastScreenState extends State<TeacherBroadcastScreen> {
                       : const Icon(Icons.check_circle_rounded, size: 20),
                   label: Text(
                     saving ? 'Saving…' : 'Mark practiced',
+                    maxLines: 1,
+                    softWrap: false,
+                    overflow: TextOverflow.fade,
                     style: GoogleFonts.poppins(
                       fontSize: 13,
                       fontWeight: FontWeight.w800,
@@ -4057,7 +5022,8 @@ class _TeacherBroadcastScreenState extends State<TeacherBroadcastScreen> {
   Widget _doneChip(PracticeEntry e) {
     return InkWell(
       borderRadius: BorderRadius.circular(20),
-      onTap: () => _confirmUndo(e),
+      onTap: () => _askRating(e), // tap → rate / change rating
+      onLongPress: () => _confirmUndo(e), // long-press → undo
       child: Container(
         padding: const EdgeInsets.fromLTRB(6, 5, 10, 5),
         decoration: BoxDecoration(
@@ -4078,6 +5044,17 @@ class _TeacherBroadcastScreenState extends State<TeacherBroadcastScreen> {
                 fontWeight: FontWeight.w600,
               ),
             ),
+            Obx(() {
+              final r = cc.ratings[e.id] ?? 0;
+              return Text(
+                r > 0 ? '  ★$r' : '  ☆ rate',
+                style: GoogleFonts.poppins(
+                  color: r > 0 ? const Color(0xFFC78B00) : textSecondary,
+                  fontSize: 10.5,
+                  fontWeight: FontWeight.w800,
+                ),
+              );
+            }),
           ],
         ),
       ),
@@ -4306,6 +5283,23 @@ class _TeacherBroadcastScreenState extends State<TeacherBroadcastScreen> {
               clipBehavior: Clip.none,
               children: [
                 _avatar(name, 22, ring: speaking),
+                if (cc.mergedFrom[p.userId] != null)
+                  Positioned(
+                    right: -5,
+                    top: -5,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+                      decoration: BoxDecoration(
+                        color: const Color(0xff7A5AF8),
+                        borderRadius: BorderRadius.circular(6),
+                        border: Border.all(color: Colors.white, width: 1.2),
+                      ),
+                      child: Text(
+                        cc.mergedFrom[p.userId]!,
+                        style: GoogleFonts.poppins(color: Colors.white, fontSize: 8.5, fontWeight: FontWeight.w800),
+                      ),
+                    ),
+                  ),
                 Positioned(
                   right: -3,
                   bottom: -3,
@@ -4561,7 +5555,7 @@ class _TeacherBroadcastScreenState extends State<TeacherBroadcastScreen> {
                               ),
                             ),
                             Text(
-                              'Today • these joins are NOT counted as attendance',
+                              'Today • attendance counted, shown as "joined another timing"',
                               style: GoogleFonts.poppins(color: textSecondary, fontSize: 10.5),
                             ),
                           ],
