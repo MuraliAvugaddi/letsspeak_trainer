@@ -6,7 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:get/get.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:http/http.dart' as http;
-import 'package:stream_video_flutter/stream_video_flutter.dart';
+import 'package:letsspeak_trainer/rtc/live_room.dart'; // 🎧 LiveKit audio classes (same names as before)
 import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:letsspeak_trainer/Api/Apiend_points.dart';
 import 'package:letsspeak_trainer/Api/api_headers.dart';
@@ -73,7 +73,7 @@ class _AssemblyJoinScreenState extends State<AssemblyJoinScreen> {
     try {
       final res = await http
           .post(
-            Uri.parse("${ApiEndpoints.baseUrl}/stream/prepare-call"),
+            Uri.parse("${ApiEndpoints.baseUrl}/rtc/prepare-call"),
             headers: _headers(json: true),
             body: jsonEncode({"userId": _userId, "type": "assembly"}),
           )
@@ -154,6 +154,16 @@ class _AssemblyJoinScreenState extends State<AssemblyJoinScreen> {
 
   void _onTick() {
     if (!mounted) return;
+    // ⚡ Sir ended the special class (or the connection is gone) → leave at once
+    final st = call?.state.value;
+    if (!_leaving && st != null && (st.endedAt != null || st.status.isDisconnected)) {
+      final ended = st.endedAt != null;
+      _leave();
+      Get.snackbar(ended ? 'Class finished' : 'Disconnected',
+          ended ? 'The special class has ended. Thank you!' : 'The connection to the special class was lost.',
+          backgroundColor: const Color(0xFF0E466D), colorText: Colors.white, snackPosition: SnackPosition.TOP);
+      return;
+    }
     // Sir locked the mics while mine was on → turn it off
     if (_micOn && !_canSpeak) call?.setMicrophoneEnabled(enabled: false);
     setState(() {});

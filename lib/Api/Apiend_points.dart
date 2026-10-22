@@ -4,10 +4,10 @@ class ApiEndpoints {
   // =====================================================
 
   // 🖥️ LOCAL (laptop running `npm run dev`, phone on same Wi-Fi)
- // static const String baseUrl = "http://192.168.1.4:5001/api";
+  static const String baseUrl = "http://192.168.1.3:5001/api";
 
   // 🚀 PRODUCTION (Render): uncomment this and comment the LOCAL line above
-   static const String baseUrl = "https://lets-talk-backend-o06t.onrender.com/api";
+  // static const String baseUrl = "https://lets-talk-backend-o06t.onrender.com/api";
 
   // =====================================================
   // Auth Endpoints
@@ -30,8 +30,9 @@ class ApiEndpoints {
   // =====================================================
   // Stream audio live classes
   // =====================================================
-  static const String streamToken = "$baseUrl/stream/token";
-  static const String prepareCall = "$baseUrl/stream/prepare-call"; // server creates today's class
+  static const String streamToken = "$baseUrl/rtc/token";
+  static const String prepareCall =
+      "$baseUrl/rtc/prepare-call"; // server creates today's class
   static const String updateLiveLink = "$baseUrl/live/admin/update";
   static const String deleteLiveLink = "$baseUrl/live/admin/delete";
 
@@ -40,7 +41,8 @@ class ApiEndpoints {
   // =====================================================
   static const String practiceMark = "$baseUrl/practice/mark";
   static const String practiceList = "$baseUrl/practice/list";
-  static const String practiceRate = "$baseUrl/practice/rate"; // ⭐ 1–5 after "Mark practiced"
+  static const String practiceRate =
+      "$baseUrl/practice/rate"; // ⭐ 1–5 after "Mark practiced"
 
   // =====================================================
   // ⏰ Batch timings

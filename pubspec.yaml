@@ -33,10 +33,11 @@ dependencies:
   flutter_pdfview: ^1.4.5
   path_provider: ^2.1.6
   in_app_update: ^4.2.2
-  stream_video_flutter: ^1.5.0
+  livekit_client: ^2.5.0 # 🎧 own audio-class server (replaces stream_video_flutter)
   wakelock_plus: ^1.2.8
   firebase_core_web: 3.10.0
   internet_connection_checker_plus: ^3.1.2
+
 
 dev_dependencies:
   flutter_test:

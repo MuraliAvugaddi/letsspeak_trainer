@@ -6,8 +6,8 @@ import 'package:google_fonts/google_fonts.dart';
 import 'package:http/http.dart' as http;
 import 'package:geolocator/geolocator.dart';
 import 'package:get/get.dart';
-import 'package:stream_video_flutter/stream_video_flutter.dart';
-import 'package:stream_video_flutter/stream_video_flutter.dart' as svf show Priority;
+import 'package:letsspeak_trainer/rtc/live_room.dart'; // 🎧 LiveKit audio classes (same names as before)
+import 'package:letsspeak_trainer/rtc/live_room.dart' as svf show Priority;
 import 'package:socket_io_client/socket_io_client.dart' as IO;
 import 'package:get_storage/get_storage.dart';
 import 'package:letsspeak_trainer/Api/Apiend_points.dart';
@@ -3826,10 +3826,15 @@ class _TeacherBroadcastScreenState extends State<TeacherBroadcastScreen> {
         .toSet();
 
     await cc.finish();
-    // Remove everyone in parallel (30 students = one round-trip, not 30)
-    await Future.wait(
-      studentIds.map((id) => c.kickUser(id).then((_) {}, onError: (_) {})),
-    );
+    // ⚡ Close the class for EVERYONE in one step: every student's app gets
+    // "class ended" at the same moment (also when minimized).
+    final ended = await c.end();
+    if (ended.isFailure) {
+      // fallback: remove students one by one
+      await Future.wait(
+        studentIds.map((id) => c.kickUser(id).then((_) {}, onError: (_) {})),
+      );
+    }
     try {
       await c.leave();
     } catch (_) {}
