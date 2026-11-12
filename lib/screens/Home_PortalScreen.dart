@@ -16,10 +16,29 @@ import 'package:letsspeak_trainer/Api/batch_slots.dart';
 import 'package:letsspeak_trainer/screens/TeacherLoginScreen.dart';
 import 'package:letsspeak_trainer/screens/AssemblyJoinScreen.dart';
 import 'package:letsspeak_trainer/screens/BestStudentsScreen.dart';
+import 'package:letsspeak_trainer/screens/class_hands_panel.dart';
 
 const double instituteLat = 17.729417;
 const double instituteLng = 83.312231;
 const double allowedRadius = 40.0;
+
+/// 🔁 "Online till 8 Nov" — admin moved this student only for some days
+/// (null = normal student, no badge)
+String? tempModeText(dynamic student) {
+  if (student is! Map) return null;
+  final base = (student['modeBase'] ?? '').toString();
+  final until = DateTime.tryParse((student['modeTempUntil'] ?? '').toString())?.toLocal();
+  if (base.isEmpty || until == null) return null;
+  final mode = (student['mode'] ?? '').toString();
+  final now = DateTime.now();
+  final today = DateTime(now.year, now.month, now.day);
+  final last = DateTime(until.year, until.month, until.day);
+  final days = last.difference(today).inDays;
+  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  final when = days <= 0 ? 'today only' : (days == 1 ? 'till tomorrow' : 'till ${until.day} ${months[until.month - 1]}');
+  final label = mode == 'online' ? 'Online' : 'Offline';
+  return '$label $when (normally $base)';
+}
 
 // =========================================================================
 // 🚀 STREAM MANAGER — token + client are prepared when the portal opens,
@@ -166,6 +185,28 @@ class PracticeEntry {
   const PracticeEntry(this.id, this.name);
 }
 
+class HandEntry {
+  final String id;
+  final String name;
+  final DateTime at;
+  const HandEntry(this.id, this.name, this.at);
+}
+
+class ClassChatMsg {
+  final String fromId;
+  final String fromName;
+  final String text;
+  final DateTime at;
+  final bool mine;
+  const ClassChatMsg({
+    required this.fromId,
+    required this.fromName,
+    required this.text,
+    required this.at,
+    required this.mine,
+  });
+}
+
 class ClassroomController {
   ClassroomController._();
   static final ClassroomController instance = ClassroomController._();
@@ -179,6 +220,13 @@ class ClassroomController {
 
   final RxBool micLocked = false.obs;
   final RxSet<String> allowed = <String>{}.obs;
+
+  // ✋ RAISE HAND + 💬 QUESTIONS from students (LiveKit data messages)
+  final RxList<HandEntry> hands = <HandEntry>[].obs; // oldest first
+  final RxList<ClassChatMsg> messages = <ClassChatMsg>[].obs;
+  final RxInt unreadMessages = 0.obs;
+  bool chatOpen = false;
+  StreamSubscription<ClassSignal>? _signalSub;
 
   final Rxn<PracticeEntry> current = Rxn<PracticeEntry>();
   final RxList<PracticeEntry> queue = <PracticeEntry>[].obs; // waiting (current not included)
@@ -287,6 +335,12 @@ class ClassroomController {
     // Enforce the lock even while the trainer is on another screen / PiP
     _stateSub = call.state.asStream().listen(_enforce);
 
+    hands.clear();
+    messages.clear();
+    unreadMessages.value = 0;
+    _signalSub?.cancel();
+    _signalSub = call.signals.listen(_onSignal);
+
     _publishNow(); // fresh class: mics open, no practice
     loadPracticedToday();
     otherBatch.clear();
@@ -334,6 +388,9 @@ class ClassroomController {
     }
     _stateSub?.cancel();
     _stateSub = null;
+    _signalSub?.cancel();
+    _signalSub = null;
+    hands.clear();
     _publishTimer?.cancel();
     _visitorTimer?.cancel();
     call = null;
@@ -387,6 +444,11 @@ class ClassroomController {
 
   // A student on an old app version (or a race) unmuted while locked → mute again
   void _enforce(CallState state) {
+    // ✋ student left the class → their hand goes down
+    if (hands.isNotEmpty) {
+      final here = state.callParticipants.map((p) => p.userId).toSet();
+      hands.removeWhere((h) => !here.contains(h.id));
+    }
     if (!micLocked.value || call == null) return;
     final now = DateTime.now();
     final offenders = <String>[];
@@ -398,6 +460,84 @@ class ClassroomController {
       offenders.add(p.userId);
     }
     if (offenders.isNotEmpty) _mute(offenders);
+  }
+
+  // ---------------------------------------------------------------------
+  // ✋ Raise hand + 💬 questions
+  // ---------------------------------------------------------------------
+  void _onSignal(ClassSignal sig) {
+    if (sig.from.isEmpty || sig.fromStaff) return;
+    switch (sig.type) {
+      case 'hand':
+        final up = sig.data['up'] == true;
+        final i = hands.indexWhere((h) => h.id == sig.from);
+        if (up && i < 0) {
+          hands.add(HandEntry(sig.from, sig.fromName, DateTime.now()));
+          HapticFeedback.selectionClick();
+        } else if (!up && i >= 0) {
+          hands.removeAt(i);
+        }
+        break;
+      case 'msg':
+        final text = (sig.data['text'] ?? '').toString().trim();
+        if (text.isEmpty) return;
+        messages.add(ClassChatMsg(
+          fromId: sig.from,
+          fromName: sig.fromName,
+          text: text.length > 300 ? text.substring(0, 300) : text,
+          at: DateTime.now(),
+          mine: false,
+        ));
+        if (messages.length > 300) messages.removeAt(0);
+        if (!chatOpen) unreadMessages.value++;
+        break;
+    }
+  }
+
+  /// "Allow to speak": hand goes down + mic unlocked for this student
+  Future<void> allowHand(HandEntry h) async {
+    hands.removeWhere((e) => e.id == h.id);
+    if (micLocked.value) await setAllowed(h.id, true);
+    await call?.sendSignal({'t': 'hand_ok'}, to: [h.id]);
+  }
+
+  Future<void> lowerHand(String id) async {
+    hands.removeWhere((e) => e.id == id);
+    await call?.sendSignal({'t': 'hand_down'}, to: [id]);
+  }
+
+  Future<void> lowerAllHands() async {
+    final ids = hands.map((h) => h.id).toList();
+    hands.clear();
+    if (ids.isNotEmpty) await call?.sendSignal({'t': 'hand_down'}, to: ids);
+  }
+
+  /// Trainer message → every student in the class sees it
+  Future<bool> sendClassMessage(String text) async {
+    final t = text.trim();
+    if (t.isEmpty || call == null) return false;
+    final ok = await call!.sendSignal({'t': 'msg', 'text': t});
+    if (ok) {
+      messages.add(ClassChatMsg(fromId: teacherId, fromName: 'You', text: t, at: DateTime.now(), mine: true));
+    }
+    return ok;
+  }
+
+  /// Reply only to one student
+  Future<bool> replyTo(String studentId, String studentName, String text) async {
+    final t = text.trim();
+    if (t.isEmpty || call == null) return false;
+    final ok = await call!.sendSignal({'t': 'msg', 'text': t, 'private': true}, to: [studentId]);
+    if (ok) {
+      messages.add(ClassChatMsg(
+        fromId: teacherId,
+        fromName: 'You → $studentName',
+        text: t,
+        at: DateTime.now(),
+        mine: true,
+      ));
+    }
+    return ok;
   }
 
   // ---------------------------------------------------------------------
@@ -1286,7 +1426,21 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
     final g = _merge?['guestSections'];
     return g is List ? g.map((e) => e.toString()).toList() : const [];
   }
-  bool get _rainOn => _rainMode?['active'] == true;
+  // 🌐 offline classes online today — maybe only for some stages (empty list = all stages)
+  bool get _rainOn {
+    if (_rainMode?['active'] != true) return false;
+    final st = _rainMode?['stages'];
+    if (st is! List || st.isEmpty) return true;
+    final my = (widget.teacherData['teacherStage'] ?? widget.teacherData['stage'] ?? 'stage1')
+        .toString()
+        .toLowerCase()
+        .replaceAll(RegExp(r'\s+'), '');
+    return st.map((e) => e.toString().toLowerCase()).contains(my);
+  }
+  String get _rainStagesText {
+    final st = _rainMode?['stages'];
+    return st is List ? st.map((e) => e.toString().replaceAll('stage', 'Stage ')).join(', ') : '';
+  }
   bool get _assemblyOn => _assemblyMode?['active'] == true;
 
   static const Color backgroundColor = Color(0xffE8F2F8);
@@ -2251,7 +2405,7 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
           const SizedBox(width: 10),
           Expanded(
             child: Text(
-              '${(_rainMode?['note'] ?? '').toString().isNotEmpty ? 'Reason: ${_rainMode?['note']}\n' : ''}Today your offline class is ONLINE (set by admin). Start the live audio class — your offline students join from their app. Attendance is online today.',
+              '${(_rainMode?['note'] ?? '').toString().isNotEmpty ? 'Reason: ${_rainMode?['note']}\n' : ''}${_rainStagesText.isNotEmpty ? 'Online today: $_rainStagesText\n' : ''}Today your offline class is ONLINE (set by admin). Start the live audio class — your offline students join from their app. Attendance is online today.',
               style: GoogleFonts.poppins(color: brandNavy, fontSize: 11.5, fontWeight: FontWeight.w600, height: 1.4),
             ),
           ),
@@ -2930,6 +3084,17 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
                                     fontWeight: FontWeight.w700,
                                   ),
                                 ),
+                                if (tempModeText(student) != null)
+                                  Text(
+                                    tempModeText(student)!,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: GoogleFonts.poppins(
+                                      color: const Color(0xffE59E1B),
+                                      fontSize: 9.5,
+                                      fontWeight: FontWeight.w700,
+                                    ),
+                                  ),
                                 if ((student['mergedFrom'] ?? '').toString().isNotEmpty)
                                   Text(
                                     'From Section ${student['mergedFrom']}',
@@ -3023,6 +3188,9 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
                       children: [
                         if ((student['mergedFrom'] ?? '').toString().isNotEmpty)
                           _statusBadge('From Sec ${student['mergedFrom']}', const Color(0xff7A5AF8)),
+                        // 🔁 admin changed this student only for some days
+                        if (tempModeText(student) != null)
+                          _statusBadge(tempModeText(student)!, const Color(0xffE59E1B)),
                         _statusBadge(
                           BatchSlots.shortOf(student['batchTime'], fallback: 'No timing'),
                           brandBlue,
@@ -3905,6 +4073,7 @@ class _TeacherBroadcastScreenState extends State<TeacherBroadcastScreen> {
                       _liveStrip(students.length, speaker),
                       Obx(() => _mergeBar()),
                       Obx(() => _micLockBar()),
+                      ClassHandsBar(cc: cc), // ✋ raised hands
                       _tabBar(students.length),
                       Expanded(
                         child: AnimatedSwitcher(
@@ -3971,6 +4140,7 @@ class _TeacherBroadcastScreenState extends State<TeacherBroadcastScreen> {
         ],
       ),
       actions: [
+        ClassChatAction(cc: cc), // 💬 student questions
         Obx(() {
           final n = cc.otherBatch.length;
           return IconButton(

@@ -20,6 +20,7 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/gestures.dart';
 import 'package:get_storage/get_storage.dart';
 import 'package:http/http.dart' as http;
 import 'package:livekit_client/livekit_client.dart' as lk;
@@ -186,6 +187,17 @@ class CallStateHolder {
   }
 }
 
+/// ✋ A small message inside the class (raise hand, question, trainer reply).
+/// Sent with LiveKit data messages — no server call, arrives in ~0.1 s.
+class ClassSignal {
+  final String from; // user id of the sender
+  final String fromName;
+  final bool fromStaff;
+  final Map<String, dynamic> data;
+  const ClassSignal(this.from, this.fromName, this.fromStaff, this.data);
+  String get type => (data['t'] ?? '').toString();
+}
+
 // -------------------------------------------------------------------------
 // StreamVideo (the "client") — keeps who is logged in
 // -------------------------------------------------------------------------
@@ -223,6 +235,40 @@ class Call {
   final User _user;
   final CallStateHolder state;
 
+  // ---------------------------------------------------------------------
+  // 🌐 WEB SOUND: Chrome only plays sound after the person taps the page.
+  // We start the class sound right after joining, on every new voice, and on
+  // the next tap anywhere in the app (if Chrome blocked it before).
+  // ---------------------------------------------------------------------
+  static bool _tapHooked = false;
+
+  static void _webUnlockOnTap() {
+    if (_tapHooked) return;
+    _tapHooked = true;
+    GestureBinding.instance.pointerRouter.addGlobalRoute((PointerEvent e) {
+      if (e is! PointerDownEvent) return;
+      for (final c in StreamVideo._active.toList()) {
+        final r = c._room;
+        if (r != null && !r.canPlaybackAudio) _webStartAudio(r);
+      }
+    });
+  }
+
+  static void _webStartAudio(lk.Room room) {
+    try {
+      room.startAudio().catchError((_) {});
+    } catch (_) {}
+  }
+
+  /// 🌐 true when Chrome is still blocking the class sound (show "Tap to hear")
+  bool get soundBlocked => kIsWeb && _room != null && !_room!.canPlaybackAudio;
+
+  Future<void> unlockSound() async {
+    final r = _room;
+    if (r != null) _webStartAudio(r);
+    _emitNow();
+  }
+
   lk.Room? _room;
   lk.EventsListener<lk.RoomEvent>? _listener;
   CallStatus _status = CallStatus.idle;
@@ -231,6 +277,64 @@ class Call {
   String? _metaText;
   Timer? _emitTimer;
   bool _left = false;
+
+  // ✋ raise hand + class messages
+  final StreamController<ClassSignal> _signals = StreamController<ClassSignal>.broadcast();
+  Stream<ClassSignal> get signals => _signals.stream;
+
+  /// 🕵️ Admin / principal watching the class: NEVER shown in any list or count
+  /// (their voice still plays when they speak). Server names them "observer_<id>".
+  static bool _secret(lk.Participant p) => p.identity.startsWith('observer_');
+
+  static bool _isStaffMeta(String? meta) {
+    try {
+      final d = jsonDecode(meta ?? '');
+      return d is Map && d['role'] == 'admin';
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Trainers / admins in the class right now (user ids)
+  List<String> get staffIds => (_room?.remoteParticipants.values ?? const <lk.RemoteParticipant>[])
+      .where((p) => !_secret(p) && _isStaffMeta(p.metadata))
+      .map((p) => p.identity)
+      .toList();
+
+  /// Send a small message. to = null → everyone, else only those user ids.
+  Future<bool> sendSignal(Map<String, dynamic> data, {List<String>? to}) async {
+    final me = _room?.localParticipant;
+    if (me == null) return false;
+    if (to != null && to.isEmpty) return false;
+    try {
+      await me.publishData(
+        utf8.encode(jsonEncode(data)),
+        reliable: true,
+        destinationIdentities: to,
+        topic: 'class',
+      );
+      return true;
+    } catch (e) {
+      debugPrint('Class message error: $e');
+      return false;
+    }
+  }
+
+  void _onData(lk.DataReceivedEvent e) {
+    if (e.topic != 'class' || _signals.isClosed) return;
+    try {
+      final d = jsonDecode(utf8.decode(e.data));
+      if (d is! Map) return;
+      final p = e.participant;
+      if (p != null && _secret(p)) return; // admin never sends class signals
+      _signals.add(ClassSignal(
+        p?.identity ?? '',
+        (p == null || p.name.isEmpty) ? (p?.identity ?? '') : p.name,
+        _isStaffMeta(p?.metadata),
+        Map<String, dynamic>.from(d),
+      ));
+    } catch (_) {}
+  }
 
   String get callCid => 'default:$id';
   String get userId => _user.id;
@@ -255,13 +359,18 @@ class Call {
           adaptiveStream: true,
           dynacast: true,
           // 🎧 speech: silence is not sent (dtx) + protection against lost packets (red)
-          defaultAudioPublishOptions: lk.AudioPublishOptions(dtx: true, red: true),
+          //    🌐 web (Chrome): plain Opus — RED/DTX can make the voice silent in the browser
+          defaultAudioPublishOptions: lk.AudioPublishOptions(dtx: !kIsWeb, red: !kIsWeb),
         ),
       );
       _room = room;
       final listener = room.createListener();
       _listener = listener;
       listener.listen((event) {
+        if (event is lk.DataReceivedEvent) {
+          _onData(event);
+          return;
+        }
         if (event is lk.RoomDisconnectedEvent) {
           if (event.reason == lk.DisconnectReason.roomDeleted) {
             _endedAt = DateTime.now(); // trainer ended the class for everyone
@@ -270,6 +379,8 @@ class Call {
           _emitNow();
           return;
         }
+        // 🌐 web: Chrome blocks sound until a tap → try to start it on every new voice
+        if (kIsWeb && event is lk.TrackSubscribedEvent) _webStartAudio(room);
         if (event is lk.RoomReconnectingEvent) _status = CallStatus.reconnecting;
         if (event is lk.RoomReconnectedEvent) _status = CallStatus.connected;
         _scheduleEmit();
@@ -277,6 +388,10 @@ class Call {
       room.addListener(_scheduleEmit);
 
       await room.connect(url, token, connectOptions: const lk.ConnectOptions(autoSubscribe: true));
+      if (kIsWeb) {
+        _webUnlockOnTap();
+        _webStartAudio(room);
+      }
       _status = CallStatus.connected;
       StreamVideo._active.add(this);
       try {
@@ -456,6 +571,7 @@ class Call {
     final me = room.localParticipant;
     if (me != null) out.add(_toState(me, true));
     for (final p in room.remoteParticipants.values) {
+      if (_secret(p)) continue; // hidden admin
       out.add(_toState(p, false));
     }
     return out;

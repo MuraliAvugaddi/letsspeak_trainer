@@ -3,6 +3,7 @@ import 'package:google_fonts/google_fonts.dart';
 import 'package:letsspeak_trainer/screens/Home_PortalScreen.dart';
 import 'package:letsspeak_trainer/screens/TeacherMaterialsScreen.dart';
 import 'package:letsspeak_trainer/screens/TeacherProfileScreen.dart';
+import 'package:letsspeak_trainer/screens/TeacherTestsScreen.dart';
 
 class TeacherMainNavigation extends StatefulWidget {
   final Map<String, dynamic> teacherData;
@@ -39,6 +40,7 @@ class _TeacherMainNavigationState extends State<TeacherMainNavigation> {
     _screens = [
       TeacherPortalScreen(teacherData: widget.teacherData),
       TeacherMaterialsScreen(teacherData: widget.teacherData),
+      TeacherTestsScreen(teacherData: widget.teacherData), // ✍️ write tests for admin approval
       TeacherProfileScreen(teacherData: widget.teacherData),
     ];
   }
@@ -106,6 +108,13 @@ class _TeacherMainNavigationState extends State<TeacherMainNavigation> {
               Expanded(
                 child: _buildNavItem(
                   index: 2,
+                  icon: Icons.quiz_rounded,
+                  label: 'Tests',
+                ),
+              ),
+              Expanded(
+                child: _buildNavItem(
+                  index: 3,
                   icon: Icons.person_rounded,
                   label: 'Profile',
                 ),
@@ -228,6 +237,12 @@ class _TeacherMainNavigationState extends State<TeacherMainNavigation> {
                 const SizedBox(width: 12),
                 _buildWebNavItem(
                   index: 2,
+                  icon: Icons.quiz_rounded,
+                  label: 'Tests',
+                ),
+                const SizedBox(width: 12),
+                _buildWebNavItem(
+                  index: 3,
                   icon: Icons.person_rounded,
                   label: 'Profile',
                 ),
