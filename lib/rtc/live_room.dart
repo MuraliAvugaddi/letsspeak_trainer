@@ -360,7 +360,13 @@ class Call {
           dynacast: true,
           // 🎧 speech: silence is not sent (dtx) + protection against lost packets (red)
           //    🌐 web (Chrome): plain Opus — RED/DTX can make the voice silent in the browser
-          defaultAudioPublishOptions: lk.AudioPublishOptions(dtx: !kIsWeb, red: !kIsWeb),
+          defaultAudioPublishOptions: lk.AudioPublishOptions(
+            dtx: !kIsWeb,
+            red: !kIsWeb,
+            // 🗣 speech quality (24 kbps) instead of music (48 kbps): voice sounds the same,
+            //    but 2,000 listeners need half the server bandwidth
+            encoding: lk.AudioEncoding.presetSpeech,
+          ),
         ),
       );
       _room = room;
