@@ -34,6 +34,7 @@ dependencies:
   path_provider: ^2.1.6
   in_app_update: ^4.2.2
   livekit_client: ^2.5.0 # 🎧 own audio-class server (replaces stream_video_flutter)
+  flutter_webrtc: any # 🔊 louder class voices (same version LiveKit uses)
   wakelock_plus: ^1.2.8
   firebase_core_web: 3.10.0
   internet_connection_checker_plus: ^3.1.2
@@ -49,6 +50,7 @@ flutter:
 
   # PDF Materials Assets Paths
   assets:
+    - assets/images/class_logo.png # 🎓 trainer logo in live classes
     # - Stage 1 material
     - assets/images/satge1/Day-2_English_ST-1_(Past Be).pdf
     - assets/images/satge1/Day-3_English_ST-1 (Past Be).pdf

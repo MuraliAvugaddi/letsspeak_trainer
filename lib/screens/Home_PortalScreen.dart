@@ -8,6 +8,8 @@ import 'package:geolocator/geolocator.dart';
 import 'package:get/get.dart';
 import 'package:letsspeak_trainer/rtc/live_room.dart'; // 🎧 LiveKit audio classes (same names as before)
 import 'package:letsspeak_trainer/rtc/live_room.dart' as svf show Priority;
+import 'package:letsspeak_trainer/rtc/class_sound.dart';
+import 'package:letsspeak_trainer/services/push_service.dart'; // 🔊 speaker / phone / Bluetooth + trainer logo
 import 'package:socket_io_client/socket_io_client.dart' as IO;
 import 'package:get_storage/get_storage.dart';
 import 'package:letsspeak_trainer/Api/Apiend_points.dart';
@@ -444,6 +446,7 @@ class ClassroomController {
 
   // A student on an old app version (or a race) unmuted while locked → mute again
   void _enforce(CallState state) {
+    if (!state.status.isConnected) return; // 🛟 rejoining → list is empty for a moment
     // ✋ student left the class → their hand goes down
     if (hands.isNotEmpty) {
       final here = state.callParticipants.map((p) => p.userId).toSet();
@@ -1122,7 +1125,24 @@ class _FloatingTrainerPiPWidgetState extends State<FloatingTrainerPiPWidget> {
                       ),
                       child: Row(
                         children: [
-                          if (speaker != null) ...[
+                          if (speaker != null && (speaker.isStaff || speaker.userId == teacherId)) ...[
+                            // 🎓 trainer speaking → Let's Speak logo
+                            const TrainerLogoAvatar(radius: 17),
+                            const SizedBox(width: 9),
+                            Expanded(
+                              child: Text(
+                                speaker.userId == teacherId ? "You are speaking" : speakerName,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: GoogleFonts.poppins(
+                                  color: textDark,
+                                  fontSize: 12,
+                                  fontWeight: FontWeight.w800,
+                                ),
+                              ),
+                            ),
+                            const _SpeakingBars(),
+                          ] else if (speaker != null) ...[
                             Container(
                               width: 34,
                               height: 34,
@@ -2020,13 +2040,8 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
         )
         .length;
     final int unpaidCount = totalCount - paidCount;
-    final int presentCount = allAssignedStudents
-        .where(
-          (s) =>
-              (s['attendanceStatus'] ?? 'Absent').toString().toLowerCase() ==
-              'present',
-        )
-        .length;
+    // ✅ came to class today = Present, Late, Partial or in the class right now
+    final int presentCount = allAssignedStudents.where(_cameToday).length;
     final int absentCount = totalCount - presentCount;
 
     List<dynamic> filteredStudents = List<dynamic>.from(allAssignedStudents);
@@ -2045,21 +2060,9 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
           )
           .toList();
     } else if (activeFilter == 'present') {
-      filteredStudents = filteredStudents
-          .where(
-            (s) =>
-                (s['attendanceStatus'] ?? 'Absent').toString().toLowerCase() ==
-                'present',
-          )
-          .toList();
+      filteredStudents = filteredStudents.where(_cameToday).toList();
     } else if (activeFilter == 'absent') {
-      filteredStudents = filteredStudents
-          .where(
-            (s) =>
-                (s['attendanceStatus'] ?? 'Absent').toString().toLowerCase() ==
-                'absent',
-          )
-          .toList();
+      filteredStudents = filteredStudents.where((s) => !_cameToday(s)).toList();
     }
 
     // ⏰ Batch timing filter
@@ -2179,6 +2182,7 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
     await TrainerOnlineSession.leave();
     GlobalAudioOverlayController.removeOverlay();
     await StreamManager.reset();
+    await PushService.unregister(); // 🔕 no more notifications for this trainer on this phone
 
     final box = GetStorage();
     await box.remove('teacher_profile');
@@ -2663,6 +2667,40 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
     );
   }
 
+  // ✅ Attendance today. The server sends Present / Late / Partial / Absent / Holiday.
+  // Before, only the exact word "Present" was counted → Late / Partial / students
+  // who are in the class right now were missing from "Present" (and from "Absent").
+  static bool _cameToday(dynamic s) {
+    if (s is! Map) return false;
+    final a = (s['attendanceStatus'] ?? '').toString().toLowerCase();
+    return a == 'present' || a == 'late' || a == 'partial' || s['inClassNow'] == true;
+  }
+
+  static String _attendanceLabel(dynamic s) {
+    final a = (s is Map ? (s['attendanceStatus'] ?? '') : '').toString().toLowerCase();
+    if (s is Map && s['inClassNow'] == true && a != 'late' && a != 'partial') return 'In class';
+    if (a == 'late') return 'Late';
+    if (a == 'partial') return 'Partial';
+    if (a == 'present') return 'Present';
+    if (a == 'holiday') return 'Holiday';
+    return 'Absent';
+  }
+
+  Color _attendanceColor(dynamic s) {
+    switch (_attendanceLabel(s)) {
+      case 'Present':
+      case 'In class':
+        return accentGreen;
+      case 'Late':
+      case 'Partial':
+        return const Color(0xffE59E1B);
+      case 'Holiday':
+        return accentBlue;
+      default:
+        return accentRed;
+    }
+  }
+
   Widget _buildOverviewCard(
     int total,
     int present,
@@ -3052,8 +3090,6 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
                     student['name']?.toString().trim().isNotEmpty == true
                     ? student['name'].toString()
                     : 'Student';
-                final String attendance =
-                    student['attendanceStatus']?.toString() ?? 'Absent';
                 final bool paid =
                     (student['feeStatus'] ?? 'unpaid')
                         .toString()
@@ -3118,10 +3154,8 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
                     ),
                     DataCell(
                       _statusBadge(
-                        attendance,
-                        attendance.toLowerCase() == 'present'
-                            ? accentGreen
-                            : accentRed,
+                        _attendanceLabel(student),
+                        _attendanceColor(student),
                       ),
                     ),
                     DataCell(
@@ -3148,12 +3182,9 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
             student['name']?.toString().trim().isNotEmpty == true
             ? student['name'].toString()
             : 'Student';
-        final String attendance =
-            student['attendanceStatus']?.toString() ?? 'Absent';
         final bool paid =
             (student['feeStatus'] ?? 'unpaid').toString().toLowerCase() ==
             'paid';
-        final bool present = attendance.toLowerCase() == 'present';
 
         return Container(
           margin: const EdgeInsets.only(bottom: 10),
@@ -3196,8 +3227,8 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
                           brandBlue,
                         ),
                         _statusBadge(
-                          present ? 'Present' : 'Absent',
-                          present ? accentGreen : accentRed,
+                          _attendanceLabel(student),
+                          _attendanceColor(student),
                         ),
                         _statusBadge(
                           paid ? 'Paid' : 'Unpaid',
@@ -4071,6 +4102,25 @@ class _TeacherBroadcastScreenState extends State<TeacherBroadcastScreen> {
                   child: Column(
                     children: [
                       _liveStrip(students.length, speaker),
+                      // 🛟 network dropped → joining again by itself (students stay in the class)
+                      if (state.status.isReconnecting)
+                        _netBanner(
+                          Icons.sync_rounded,
+                          'Connection lost — joining your class again… Students are still in the class.',
+                          const Color(0xFFDD6B20),
+                        )
+                      else if (state.status.isDisconnected && !_leaving)
+                        _netBanner(
+                          Icons.cloud_off_rounded,
+                          'No internet for a long time — you are out of the class. Tap End, then start the class again.',
+                          const Color(0xFFC4320A),
+                        )
+                      else if (me?.weakNet ?? false)
+                        _netBanner(
+                          Icons.signal_wifi_bad_rounded,
+                          'Your internet is weak. Students may not hear you clearly.',
+                          const Color(0xFFC4320A),
+                        ),
                       Obx(() => _mergeBar()),
                       Obx(() => _micLockBar()),
                       ClassHandsBar(cc: cc), // ✋ raised hands
@@ -4174,6 +4224,8 @@ class _TeacherBroadcastScreenState extends State<TeacherBroadcastScreen> {
             ),
           );
         }),
+        // 🔊 Speaker / Phone (ear) / Bluetooth / Headphones + volume
+        const ClassSoundButton(color: Colors.white, size: 21),
         IconButton(
           tooltip: 'Refresh',
           onPressed: () {
@@ -4190,6 +4242,30 @@ class _TeacherBroadcastScreenState extends State<TeacherBroadcastScreen> {
   // ---------------------------------------------------------------------
   // Top: live strip + mic lock
   // ---------------------------------------------------------------------
+  Widget _netBanner(IconData icon, String text, Color color) {
+    return Container(
+      margin: const EdgeInsets.fromLTRB(14, 8, 14, 0),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+      decoration: BoxDecoration(
+        color: color.withOpacity(.10),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: color.withOpacity(.35)),
+      ),
+      child: Row(
+        children: [
+          Icon(icon, size: 17, color: color),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              text,
+              style: GoogleFonts.poppins(color: color, fontSize: 11.5, fontWeight: FontWeight.w600, height: 1.3),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _liveStrip(int joined, CallParticipantState? speaker) {
     final int enrolled = widget.enrolledStudents.length;
     return Container(
@@ -5458,6 +5534,8 @@ class _TeacherBroadcastScreenState extends State<TeacherBroadcastScreen> {
               clipBehavior: Clip.none,
               children: [
                 _avatar(name, 22, ring: speaking),
+                if (p.weakNet) // 📶 this student's internet is weak
+                  const Positioned(left: -5, bottom: -3, child: WeakNetDot(size: 17)),
                 if (cc.mergedFrom[p.userId] != null)
                   Positioned(
                     right: -5,

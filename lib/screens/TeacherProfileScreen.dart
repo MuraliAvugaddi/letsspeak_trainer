@@ -5,6 +5,7 @@ import 'package:google_fonts/google_fonts.dart';
 import 'package:letsspeak_trainer/screens/Home_PortalScreen.dart';
 import 'package:letsspeak_trainer/screens/TeacherLoginScreen.dart';
 import 'package:letsspeak_trainer/screens/teacher_attdance.dart';
+import 'package:letsspeak_trainer/services/push_service.dart';
 
 class TeacherProfileScreen extends StatelessWidget {
   final Map<String, dynamic> teacherData;
@@ -907,7 +908,8 @@ class TeacherProfileScreen extends StatelessWidget {
 
                   Expanded(
                     child: ElevatedButton(
-                      onPressed: () {
+                      onPressed: () async {
+                        await PushService.unregister(); // 🔕 stop notifications on this phone
                         box.erase();
 
                         Get.offAll(() => const TeacherLoginScreen());

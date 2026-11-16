@@ -1,6 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:letsspeak_trainer/screens/Home_PortalScreen.dart';
+import 'package:letsspeak_trainer/screens/TeacherAlertsScreen.dart';
+import 'package:letsspeak_trainer/services/push_service.dart';
+import 'package:letsspeak_trainer/services/trainer_alerts.dart';
 import 'package:letsspeak_trainer/screens/TeacherMaterialsScreen.dart';
 import 'package:letsspeak_trainer/screens/TeacherProfileScreen.dart';
 import 'package:letsspeak_trainer/screens/TeacherTestsScreen.dart';
@@ -39,10 +42,34 @@ class _TeacherMainNavigationState extends State<TeacherMainNavigation> {
 
     _screens = [
       TeacherPortalScreen(teacherData: widget.teacherData),
+      const TeacherAlertsScreen(), // 👋 new students added to my class
       TeacherMaterialsScreen(teacherData: widget.teacherData),
       TeacherTestsScreen(teacherData: widget.teacherData), // ✍️ write tests for admin approval
       TeacherProfileScreen(teacherData: widget.teacherData),
     ];
+
+    // 👋 "New student in your class": live pop-up + list + phone notification
+    final id = (widget.teacherData['_id'] ?? widget.teacherData['id'] ?? '').toString();
+    TrainerAlerts.start(id);
+    PushService.register();
+    TrainerAlerts.openTab.addListener(_openAlerts);
+  }
+
+  @override
+  void dispose() {
+    TrainerAlerts.openTab.removeListener(_openAlerts);
+    super.dispose();
+  }
+
+  void _openAlerts() {
+    if (!mounted) return;
+    _select(1);
+  }
+
+  void _select(int index) {
+    setState(() => _currentIndex = index);
+    // looked at the list → not "new" any more
+    if (index == 1) Future.delayed(const Duration(seconds: 2), TrainerAlerts.markAllRead);
   }
 
   @override
@@ -101,20 +128,27 @@ class _TeacherMainNavigationState extends State<TeacherMainNavigation> {
               Expanded(
                 child: _buildNavItem(
                   index: 1,
+                  icon: Icons.notifications_rounded,
+                  label: 'New',
+                ),
+              ),
+              Expanded(
+                child: _buildNavItem(
+                  index: 2,
                   icon: Icons.menu_book_rounded,
                   label: 'Materials',
                 ),
               ),
               Expanded(
                 child: _buildNavItem(
-                  index: 2,
+                  index: 3,
                   icon: Icons.quiz_rounded,
                   label: 'Tests',
                 ),
               ),
               Expanded(
                 child: _buildNavItem(
-                  index: 3,
+                  index: 4,
                   icon: Icons.person_rounded,
                   label: 'Profile',
                 ),
@@ -123,6 +157,21 @@ class _TeacherMainNavigationState extends State<TeacherMainNavigation> {
           ),
         ),
       ),
+    );
+  }
+
+  // 🔴 number of new students on the "New" tab
+  Widget _withBadge(int index, Widget icon) {
+    if (index != 1) return icon;
+    return ValueListenableBuilder<int>(
+      valueListenable: TrainerAlerts.unread,
+      builder: (_, n, child) => Badge(
+        isLabelVisible: n > 0,
+        label: Text(n > 99 ? '99+' : '$n'),
+        backgroundColor: const Color(0xFFE85D5D),
+        child: child,
+      ),
+      child: icon,
     );
   }
 
@@ -141,10 +190,7 @@ class _TeacherMainNavigationState extends State<TeacherMainNavigation> {
       borderRadius: BorderRadius.circular(18),
       onTap: () {
         if (_currentIndex == index) return;
-
-        setState(() {
-          _currentIndex = index;
-        });
+        _select(index);
       },
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 220),
@@ -170,10 +216,13 @@ class _TeacherMainNavigationState extends State<TeacherMainNavigation> {
                     : Colors.transparent,
                 borderRadius: BorderRadius.circular(12),
               ),
-              child: Icon(
-                icon,
-                size: selected ? 23 : 22,
-                color: selected ? brandNavy : brandNavy.withValues(alpha: 0.48),
+              child: _withBadge(
+                index,
+                Icon(
+                  icon,
+                  size: selected ? 23 : 22,
+                  color: selected ? brandNavy : brandNavy.withValues(alpha: 0.48),
+                ),
               ),
             ),
 
@@ -217,7 +266,7 @@ class _TeacherMainNavigationState extends State<TeacherMainNavigation> {
       ),
       child: Center(
         child: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 700),
+          constraints: const BoxConstraints(maxWidth: 900),
           child: Padding(
             padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 8),
             child: Row(
@@ -231,18 +280,24 @@ class _TeacherMainNavigationState extends State<TeacherMainNavigation> {
                 const SizedBox(width: 12),
                 _buildWebNavItem(
                   index: 1,
+                  icon: Icons.notifications_rounded,
+                  label: 'New students',
+                ),
+                const SizedBox(width: 12),
+                _buildWebNavItem(
+                  index: 2,
                   icon: Icons.menu_book_rounded,
                   label: 'Materials',
                 ),
                 const SizedBox(width: 12),
                 _buildWebNavItem(
-                  index: 2,
+                  index: 3,
                   icon: Icons.quiz_rounded,
                   label: 'Tests',
                 ),
                 const SizedBox(width: 12),
                 _buildWebNavItem(
-                  index: 3,
+                  index: 4,
                   icon: Icons.person_rounded,
                   label: 'Profile',
                 ),
@@ -269,15 +324,12 @@ class _TeacherMainNavigationState extends State<TeacherMainNavigation> {
       borderRadius: BorderRadius.circular(18),
       onTap: () {
         if (_currentIndex == index) return;
-
-        setState(() {
-          _currentIndex = index;
-        });
+        _select(index);
       },
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 220),
         curve: Curves.easeOut,
-        width: 180,
+        width: 150,
         height: 56,
         padding: const EdgeInsets.symmetric(horizontal: 18),
         decoration: BoxDecoration(
@@ -304,12 +356,15 @@ class _TeacherMainNavigationState extends State<TeacherMainNavigation> {
                     : brandLightBlue.withValues(alpha: 0.14),
                 borderRadius: BorderRadius.circular(12),
               ),
-              child: Icon(
-                icon,
-                size: 21,
-                color: selected
-                    ? Colors.white
-                    : brandNavy.withValues(alpha: 0.62),
+              child: _withBadge(
+                index,
+                Icon(
+                  icon,
+                  size: 21,
+                  color: selected
+                      ? Colors.white
+                      : brandNavy.withValues(alpha: 0.62),
+                ),
               ),
             ),
 

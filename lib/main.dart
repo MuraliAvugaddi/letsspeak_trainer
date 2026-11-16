@@ -3,10 +3,12 @@ import 'package:get/get.dart';
 import 'package:get_storage/get_storage.dart';
 import 'package:letsspeak_trainer/screens/TeacherLoginScreen.dart';
 import 'package:letsspeak_trainer/screens/TeacherMainNavigation.dart';
+import 'package:letsspeak_trainer/services/push_service.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await GetStorage.init();
+  await PushService.init(); // 🔔 "New student" notifications (off if Firebase is not set up)
 
   final box = GetStorage();
   final rawProfile = box.read('teacher_profile');
