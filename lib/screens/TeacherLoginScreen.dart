@@ -63,7 +63,7 @@ class _TeacherLoginScreenState extends State<TeacherLoginScreen> {
       final response = await http.post(
         Uri.parse(ApiEndpoints.login),
         headers: {"Content-Type": "application/json"},
-        body: jsonEncode({"phone": phone, "password": password}),
+        body: jsonEncode({"phone": phone, "password": password, "app": "trainer"}), // 👥 trainer account
       );
 
       final data = jsonDecode(response.body);
