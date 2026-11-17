@@ -1,21 +1,60 @@
 package com.example.letsspeak_trainer
 
+import android.app.PictureInPictureParams
 import android.content.Context
+import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.media.MediaRecorder
 import android.os.Build
+import android.util.Rational
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
+import io.flutter.embedding.engine.FlutterEngineCache
 import io.flutter.plugin.common.MethodChannel
 
 class MainActivity : FlutterActivity() {
+
+    // 📺 class as a small window over WhatsApp / other apps (only while in class)
+    //    (kept in the companion object → still known if Android re-opens this screen)
+    private var classChannel: MethodChannel? = null
+
+    // ---------------------------------------------------------------
+    // 🛟 The app (and the live class inside it) lives in ONE Flutter engine that
+    // survives when Android closes this screen (small window closed, phone
+    // cleaning memory, Oppo / Vivo / Realme "optimisation", back button...).
+    // Before: screen closed → engine closed → class gone + app started from the
+    // splash again (trainer had to log in again). Now: screen comes back → same
+    // class, same page, nothing restarts.
+    // ---------------------------------------------------------------
+    override fun provideFlutterEngine(context: Context): FlutterEngine? {
+        val cache = FlutterEngineCache.getInstance()
+        cache.get(ENGINE_ID)?.let { return it }
+        val engine = FlutterEngine(context.applicationContext)
+        cache.put(ENGINE_ID, engine)
+        return engine
+    }
+
+    override fun shouldDestroyEngineWithHost(): Boolean = false
+
+    companion object {
+        private const val ENGINE_ID = "letsspeak_main"
+        private var pipWanted = false
+    }
+
+    override fun onResume() {
+        super.onResume()
+        updatePip() // screen re-opened → small window setting again
+    }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
 
         // 🛟 live class: keep running in the background + list Bluetooth / headphones
-        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "letsspeak/class_service")
+        val channel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "letsspeak/class_service")
+        classChannel = channel
+        channel
             .setMethodCallHandler { call, result ->
                 when (call.method) {
                     "start" -> {
@@ -34,6 +73,11 @@ class MainActivity : FlutterActivity() {
                         ClassAudioService.stop(applicationContext)
                         result.success(true)
                     }
+                    "pip" -> {
+                        pipWanted = call.argument<Boolean>("on") == true
+                        updatePip()
+                        result.success(true)
+                    }
                     "outputs" -> result.success(soundDevices())
                     "callState" -> result.success(callState(call.argument<Boolean>("micOn") == true))
                     "restoreMode" -> {
@@ -50,15 +94,14 @@ class MainActivity : FlutterActivity() {
 
     /**
      * 📞 Is the phone in a call?
-     *  phoneCall: normal SIM call (ringing / talking)
+     *  phoneCall: normal SIM call — only once it is ANSWERED (ringing → class keeps going,
+     *             so the person can say "wait, I have a call", mute and then pick up)
      *  voipCall : WhatsApp / other app call (another app is using the mic for a call)
      */
     private fun callState(myMicOn: Boolean): Map<String, Any> {
         val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
         val mode = am.mode
-        val phoneCall = mode == AudioManager.MODE_RINGTONE ||
-            mode == AudioManager.MODE_IN_CALL ||
-            (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && mode == AudioManager.MODE_CALL_SCREENING)
+        val phoneCall = mode == AudioManager.MODE_IN_CALL
         var voipCall = false
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             try {
@@ -70,6 +113,47 @@ class MainActivity : FlutterActivity() {
             } catch (_: Exception) {}
         }
         return mapOf("mode" to mode, "phoneCall" to phoneCall, "voipCall" to voipCall)
+    }
+
+    // ---------------------------------------------------------------
+    // 📺 SMALL WINDOW (picture-in-picture), Android 8+
+    // Android 12+: goes small by itself when the person leaves the app.
+    // Android 8–11: onUserLeaveHint (home button / recent apps) makes it small.
+    // ---------------------------------------------------------------
+    private fun pipSupported(): Boolean =
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
+            packageManager.hasSystemFeature(PackageManager.FEATURE_PICTURE_IN_PICTURE)
+
+    private fun pipParams(): PictureInPictureParams? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return null
+        val b = PictureInPictureParams.Builder().setAspectRatio(Rational(3, 2))
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            b.setAutoEnterEnabled(pipWanted)
+            b.setSeamlessResizeEnabled(false)
+        }
+        return b.build()
+    }
+
+    private fun updatePip() {
+        if (!pipSupported()) return
+        try {
+            pipParams()?.let { setPictureInPictureParams(it) }
+        } catch (_: Exception) {}
+    }
+
+    override fun onUserLeaveHint() {
+        super.onUserLeaveHint()
+        if (!pipWanted || !pipSupported() || Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) return
+        try {
+            pipParams()?.let { enterPictureInPictureMode(it) }
+        } catch (_: Exception) {}
+    }
+
+    override fun onPictureInPictureModeChanged(isInPictureInPictureMode: Boolean, newConfig: Configuration) {
+        super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
+        try {
+            classChannel?.invokeMethod("pipChanged", isInPictureInPictureMode)
+        } catch (_: Exception) {}
     }
 
     /** Connected Bluetooth / wired headphones → [{type, name}] */

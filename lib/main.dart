@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:letsspeak_trainer/rtc/class_sound.dart'; // 📺 class small window
 import 'package:get/get.dart';
 import 'package:get_storage/get_storage.dart';
 import 'package:letsspeak_trainer/screens/TeacherLoginScreen.dart';
@@ -37,6 +38,8 @@ class TeacherApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return GetMaterialApp(
+      // 📺 class as a small window on top of WhatsApp / other apps
+      builder: (context, child) => ClassPipView(child: child),
       title: 'Teacher & Trainer Portal',
       debugShowCheckedModeBanner: false,
       theme: ThemeData.dark().copyWith(

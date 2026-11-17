@@ -105,6 +105,60 @@ bool get _isMobile => _isAndroid || _isIOS;
 // 🛟 Android: keep the class alive in the background (native service in
 // MainActivity.kt / ClassAudioService.kt). Also lists the sound devices.
 // -------------------------------------------------------------------------
+// -------------------------------------------------------------------------
+// 📺 SMALL WINDOW (Android picture-in-picture)
+// In class → student / trainer opens WhatsApp (home button, recent apps) →
+// the class shrinks to a small window ON TOP of WhatsApp. Tap it → back to class.
+// The class keeps running the whole time (sound + mic as before).
+// -------------------------------------------------------------------------
+class ClassPip {
+  /// true while the app is showing as the small window
+  static final ValueNotifier<bool> inPip = ValueNotifier<bool>(false);
+
+  /// what the small window shows
+  static final ValueNotifier<bool> micOn = ValueNotifier<bool>(false);
+  static final ValueNotifier<String> speaking = ValueNotifier<String>('');
+  static final ValueNotifier<bool> onCall = ValueNotifier<bool>(false);
+
+  static bool _allowed = false;
+  static bool _wired = false;
+
+  static void _wire() {
+    if (_wired) return;
+    _wired = true;
+    _Native._ch.setMethodCallHandler((c) async {
+      if (c.method == 'pipChanged') inPip.value = c.arguments == true;
+      return null;
+    });
+  }
+
+  /// In class → leaving the app shows the small window. Class over → normal again.
+  static Future<void> _allow(bool on) async {
+    if (!_isAndroid || on == _allowed) return;
+    _allowed = on;
+    _wire();
+    try {
+      await _Native._ch.invokeMethod('pip', {'on': on});
+    } catch (e) {
+      debugPrint('Small window: $e');
+    }
+  }
+
+  static void _update(Call c, lk.Room? room) {
+    if (!_isAndroid || !_allowed || room == null) return;
+    micOn.value = room.localParticipant?.isMicrophoneEnabled() ?? false;
+    onCall.value = c._inCall;
+    String who = '';
+    for (final p in room.activeSpeakers) {
+      if (p is lk.RemoteParticipant && !Call._secret(p)) {
+        who = p.name.isEmpty ? p.identity : p.name;
+        break;
+      }
+    }
+    speaking.value = who;
+  }
+}
+
 class _Native {
   static const MethodChannel _ch = MethodChannel('letsspeak/class_service');
   static bool _on = false;
@@ -826,6 +880,8 @@ class Call {
         WakelockPlus.disable();
       }
     } catch (_) {}
+    // 📺 small window over other apps: only while a class is running
+    unawaited(ClassPip._allow(on || StreamVideo._active.isNotEmpty));
   }
 
   // -------------------------------------------------------------------
@@ -1235,6 +1291,7 @@ class Call {
         room != null &&
         !_status.isDisconnected &&
         room.connectionState != lk.ConnectionState.disconnected;
+    ClassPip._update(this, room); // 📺 small window text
     state._set(
       CallState(
         callId: id,

@@ -312,3 +312,132 @@ class WeakNetDot extends StatelessWidget {
     );
   }
 }
+
+
+// =========================================================================
+// 📺 SMALL WINDOW — what the class looks like on top of WhatsApp / other apps
+// (main.dart: GetMaterialApp(builder: (context, child) => ClassPipView(child: child)))
+// The app underneath stays exactly as it is → tap the window = back in class.
+// =========================================================================
+class ClassPipView extends StatelessWidget {
+  final Widget? child;
+  const ClassPipView({super.key, this.child});
+
+  @override
+  Widget build(BuildContext context) {
+    return ValueListenableBuilder<bool>(
+      valueListenable: ClassPip.inPip,
+      builder: (context, pip, _) => Stack(
+        fit: StackFit.expand,
+        children: [
+          child ?? const SizedBox.shrink(),
+          if (pip) const Positioned.fill(child: _PipCard()),
+        ],
+      ),
+    );
+  }
+}
+
+class _PipCard extends StatelessWidget {
+  const _PipCard();
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: const Color(0xFF0E2F48),
+      child: FittedBox(
+        fit: BoxFit.contain,
+        child: SizedBox(
+          width: 300,
+          height: 200,
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Row(
+                  children: [
+                    const TrainerLogoAvatar(radius: 30, ring: true),
+                    const SizedBox(width: 14),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            children: [
+                              Container(
+                                width: 10,
+                                height: 10,
+                                decoration: const BoxDecoration(color: Color(0xFFFF4D4F), shape: BoxShape.circle),
+                              ),
+                              const SizedBox(width: 6),
+                              Text(
+                                'LIVE CLASS',
+                                style: GoogleFonts.poppins(
+                                  color: Colors.white,
+                                  fontSize: 16,
+                                  fontWeight: FontWeight.w700,
+                                  letterSpacing: 0.6,
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 4),
+                          ValueListenableBuilder<bool>(
+                            valueListenable: ClassPip.onCall,
+                            builder: (context, onCall, _) => ValueListenableBuilder<String>(
+                              valueListenable: ClassPip.speaking,
+                              builder: (context, who, _) => Text(
+                                onCall
+                                    ? 'Paused — you are on a call'
+                                    : (who.isEmpty ? 'Class is running' : '$who is speaking'),
+                                maxLines: 2,
+                                overflow: TextOverflow.ellipsis,
+                                style: GoogleFonts.poppins(color: const Color(0xFFB9D3E6), fontSize: 14),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 16),
+                Row(
+                  children: [
+                    ValueListenableBuilder<bool>(
+                      valueListenable: ClassPip.micOn,
+                      builder: (context, on, _) => Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                        decoration: BoxDecoration(
+                          color: on ? _teal : const Color(0xFF3A5268),
+                          borderRadius: BorderRadius.circular(20),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(on ? Icons.mic_rounded : Icons.mic_off_rounded, color: Colors.white, size: 18),
+                            const SizedBox(width: 6),
+                            Text(
+                              on ? 'Mic on' : 'Muted',
+                              style: GoogleFonts.poppins(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w600),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                    const Spacer(),
+                    Text(
+                      'Tap to open',
+                      style: GoogleFonts.poppins(color: const Color(0xFF8FB0C8), fontSize: 13),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}

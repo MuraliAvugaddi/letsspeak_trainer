@@ -73,8 +73,11 @@ class _TeacherLoginScreenState extends State<TeacherLoginScreen> {
 
         if (userRole == 'teacher' || userRole == 'manager') {
           // Token is needed for every trainer API call and the live class.
-          // (Profile is still not saved, so login is required after restart.)
-          GetStorage().write('token', data['token']);
+          // 🔑 Save profile + token → trainer stays logged in after the app
+          //    restarts (token is valid for 1 year). Logout clears both.
+          final box = GetStorage();
+          await box.write('token', data['token']);
+          await box.write('teacher_profile', data['user']);
 
           Get.offAll(() => TeacherMainNavigation(teacherData: data['user']));
 
