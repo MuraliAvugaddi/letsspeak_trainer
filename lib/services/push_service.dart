@@ -15,7 +15,7 @@ import 'package:letsspeak_trainer/services/trainer_alerts.dart';
 ///   after login (navigation):    PushService.register();
 ///   logout:                      await PushService.unregister();
 ///
-/// Needs android/app/google-services.json for com.example.letsspeak_trainer
+/// Needs android/app/google-services.json for com.speakwithsurendratrainer.app
 /// (Firebase console → same project as the student app → Add Android app).
 /// Without it the app still works — only phone notifications are off.
 class PushService {

@@ -648,6 +648,8 @@ class Call {
 
   // 🛟 join again by itself after the connection is lost
   bool _wantMic = false; // mic was on → switch it on again after rejoining
+  bool _over = false; // 🛑 really finished (ended / removed / gave up) — only then "disconnected"
+  Timer? _lostCheck;
   DateTime? _lostAt;
   int _tries = 0;
   Timer? _rejoinTimer;
@@ -749,6 +751,7 @@ class Call {
 
   Future<Result<void>> join({CallConnectOptions? connectOptions}) async {
     _left = false;
+    _over = false;
     _endedAt = null;
     _lostAt = null;
     _tries = 0;
@@ -962,8 +965,25 @@ class Call {
     _scheduleRejoin();
   }
 
+  /// Connection dropped but LiveKit didn't tell us why → start joining again
+  /// ourselves (2 s later, so a real "removed / ended" message wins first).
+  void _ensureRejoin() {
+    if (_left || _over || _endedAt != null || _rejoining) return;
+    if (_rejoinTimer?.isActive ?? false) return;
+    if (_lostCheck?.isActive ?? false) return;
+    _lostCheck = Timer(const Duration(seconds: 2), () {
+      final room = _room;
+      if (_left || _over || _endedAt != null || _rejoining) return;
+      if (_rejoinTimer?.isActive ?? false) return;
+      if (room != null && room.connectionState != lk.ConnectionState.disconnected) return;
+      _scheduleRejoin();
+    });
+  }
+
   /// Give up for good → screens close the class
   void _finish() {
+    _over = true;
+    _lostCheck?.cancel();
     _rejoinTimer?.cancel();
     _stopCallWatch();
     _life?.dispose();
@@ -977,7 +997,7 @@ class Call {
   }
 
   void _scheduleRejoin() {
-    if (_left || _endedAt != null) return;
+    if (_left || _over || _endedAt != null) return;
     final now = DateTime.now();
     _lostAt ??= now;
     if (now.difference(_lostAt!) > _giveUpAfter) {
@@ -1277,11 +1297,16 @@ class Call {
           if (!_status.isReconnecting) _status = CallStatus.connecting;
           break;
         case lk.ConnectionState.disconnected:
-          // our own rejoin is running → still "reconnecting", not the end
-          if (!_status.isIdle &&
-              !_status.isConnecting &&
-              !_status.isReconnecting) {
+          // 🐞 FIX "kicked out for no reason": the connection dropping is NOT the
+          // end of the class. Before, the screen saw "disconnected" for a moment
+          // and closed the class. Now it's "reconnecting" and the app joins again
+          // by itself. Only a real end (trainer ended / removed / gave up after
+          // 3 minutes) becomes "disconnected" (set in _finish).
+          if (_over) {
             _status = CallStatus.disconnected;
+          } else if (!_status.isIdle && !_status.isConnecting) {
+            _status = CallStatus.reconnecting;
+            _ensureRejoin();
           }
           break;
       }
