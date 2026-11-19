@@ -12,7 +12,7 @@ if (file("google-services.json").exists()) {
 }
 
 android {
-    namespace = "com.example.letsspeak_trainer"
+    namespace = "com.speakwithsurendratrainer.app"
 
     compileSdk = flutter.compileSdkVersion
 
@@ -29,7 +29,7 @@ android {
     }
 
     defaultConfig {
-        applicationId = "com.example.letsspeak_trainer"
+        applicationId = "com.speakwithsurendratrainer.app"
 
         minSdk = flutter.minSdkVersion
         targetSdk = flutter.targetSdkVersion

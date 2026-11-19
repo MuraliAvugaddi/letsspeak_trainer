@@ -1,4 +1,4 @@
-package com.example.letsspeak_trainer
+package com.speakwithsurendratrainer.app
 
 import android.app.PictureInPictureParams
 import android.content.Context
