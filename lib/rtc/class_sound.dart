@@ -319,21 +319,52 @@ class WeakNetDot extends StatelessWidget {
 // (main.dart: GetMaterialApp(builder: (context, child) => ClassPipView(child: child)))
 // The app underneath stays exactly as it is → tap the window = back in class.
 // =========================================================================
-class ClassPipView extends StatelessWidget {
+class ClassPipView extends StatefulWidget {
   final Widget? child;
   const ClassPipView({super.key, this.child});
+
+  @override
+  State<ClassPipView> createState() => _ClassPipViewState();
+}
+
+class _ClassPipViewState extends State<ClassPipView> {
+  // 📐 last full-screen size → in the small window the app underneath keeps
+  // this size (hidden behind the card), so no "RenderFlex overflowed" errors.
+  Size _fullSize = const Size(400, 800);
 
   @override
   Widget build(BuildContext context) {
     return ValueListenableBuilder<bool>(
       valueListenable: ClassPip.inPip,
-      builder: (context, pip, _) => Stack(
-        fit: StackFit.expand,
-        children: [
-          child ?? const SizedBox.shrink(),
-          if (pip) const Positioned.fill(child: _PipCard()),
-        ],
-      ),
+      builder: (context, pip, _) {
+        final mq = MediaQuery.of(context);
+        if (!pip && mq.size.width >= 300 && mq.size.height >= 300) {
+          _fullSize = mq.size;
+        }
+        Widget app = widget.child ?? const SizedBox.shrink();
+        if (pip) {
+          app = ClipRect(
+            child: OverflowBox(
+              alignment: Alignment.topLeft,
+              minWidth: _fullSize.width,
+              maxWidth: _fullSize.width,
+              minHeight: _fullSize.height,
+              maxHeight: _fullSize.height,
+              child: MediaQuery(
+                data: mq.copyWith(size: _fullSize),
+                child: app,
+              ),
+            ),
+          );
+        }
+        return Stack(
+          fit: StackFit.expand,
+          children: [
+            app,
+            if (pip) const Positioned.fill(child: _PipCard()),
+          ],
+        );
+      },
     );
   }
 }
