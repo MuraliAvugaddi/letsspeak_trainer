@@ -866,16 +866,20 @@ class GlobalAudioOverlayController {
     Map<String, dynamic> teacherData,
     List<dynamic> students,
   ) {
-    if (_overlayEntry != null) return;
+    // already showing → nothing to do (an old, detached bubble is cleared)
+    if (_overlayEntry != null && _overlayEntry!.mounted) return;
+    _overlayEntry = null;
+
+    // 🫧 Bubble on the APP's main overlay → stays when the class screen closes
+    final overlayState = Get.key.currentState?.overlay ?? Overlay.maybeOf(context, rootOverlay: true);
+    if (overlayState == null) return;
+
     currentCall = call;
     currentTeacherId = teacherId;
     currentClassName = className;
     currentTeacherData = teacherData;
     currentStudents = students;
     isCallActive.value = true;
-
-    final overlayState = Overlay.of(context);
-    if (overlayState == null) return;
 
     _overlayEntry = OverlayEntry(
       builder: (context) => const FloatingTrainerPiPWidget(),
@@ -3693,6 +3697,7 @@ class _TeacherBroadcastScreenState extends State<TeacherBroadcastScreen> {
   @override
   void dispose() {
     _searchCtrl.dispose();
+    _bubbleIfStillInClass(); // 🫧 class still running → bubble on the home page
     super.dispose();
   }
 
@@ -3776,8 +3781,13 @@ class _TeacherBroadcastScreenState extends State<TeacherBroadcastScreen> {
       );
   }
 
+  // 🫧 Minimize: back button, back SWIPE, arrow or "Minimize" → bubble first,
+  // then home. The class keeps running.
+  bool _minimizing = false;
+
   void _minimize() {
-    Get.until((route) => route.isFirst);
+    if (_minimizing || _leaving) return;
+    _minimizing = true;
     GlobalAudioOverlayController.showOverlay(
       context,
       widget.call,
@@ -3786,6 +3796,28 @@ class _TeacherBroadcastScreenState extends State<TeacherBroadcastScreen> {
       widget.teacherData,
       widget.enrolledStudents,
     );
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      Get.until((route) => route.isFirst);
+    });
+  }
+
+  /// Safety net: screen closed some other way while the class still runs → bubble.
+  void _bubbleIfStillInClass() {
+    if (_leaving || GlobalAudioOverlayController.currentCall != null) return;
+    final s = widget.call.state.value;
+    if (s.endedAt != null || s.status.isDisconnected) return;
+    final call = widget.call;
+    final id = teacherId;
+    final data = widget.teacherData;
+    final students = widget.enrolledStudents;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (GlobalAudioOverlayController.currentCall != null) return;
+      final st = call.state.value;
+      if (st.endedAt != null || st.status.isDisconnected) return;
+      final ctx = Get.overlayContext ?? Get.context;
+      if (ctx == null) return;
+      GlobalAudioOverlayController.showOverlay(ctx, call, id, "Live Studio", data, students);
+    });
   }
 
   // ---------------------------------------------------------------------

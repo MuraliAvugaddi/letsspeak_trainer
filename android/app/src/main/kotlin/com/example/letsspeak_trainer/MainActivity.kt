@@ -149,6 +149,20 @@ class MainActivity : FlutterActivity() {
         } catch (_: Exception) {}
     }
 
+    // 📺 Back swipe / back button on the HOME page while a class is running:
+    // before → the app just disappeared into the background (class still playing,
+    // but nothing on screen). Now → the class becomes the small window, same as
+    // pressing the Home button. Not in class → normal back (app closes).
+    override fun popSystemNavigator(): Boolean {
+        if (pipWanted && pipSupported()) {
+            try {
+                val params = pipParams()
+                if (params != null && enterPictureInPictureMode(params)) return true
+            } catch (_: Exception) {}
+        }
+        return false
+    }
+
     override fun onPictureInPictureModeChanged(isInPictureInPictureMode: Boolean, newConfig: Configuration) {
         super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
         try {
