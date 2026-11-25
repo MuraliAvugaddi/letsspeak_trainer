@@ -137,6 +137,11 @@ class MainActivity : FlutterActivity() {
                         } catch (_: Exception) {}
                         result.success(true)
                     }
+                    "voiceGate" -> {
+                        // 🎤 clean our own mic (room noise / far voices pushed down between words)
+                        VoiceGate.enabled = call.argument<Boolean>("on") != false
+                        result.success(VoiceGate.install())
+                    }
                     "outputs" -> result.success(soundDevices())
                     "callState" -> result.success(callState(call.argument<Boolean>("micOn") == true))
                     "restoreMode" -> {

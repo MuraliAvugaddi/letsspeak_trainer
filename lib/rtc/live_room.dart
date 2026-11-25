@@ -245,6 +245,18 @@ class _Native {
     }
   }
 
+  /// 🎤 VOICE GATE on our own mic (Android): between words the room noise and
+  /// far-away voices are pushed down before the sound leaves the phone.
+  static Future<void> voiceGate(bool on) async {
+    if (!_isAndroid) return;
+    try {
+      final ok = await _ch.invokeMethod('voiceGate', {'on': on});
+      debugPrint('🎤 voice gate: ${ok == true ? 'ON' : 'not available'}');
+    } catch (e) {
+      debugPrint('🎤 voice gate: $e');
+    }
+  }
+
   /// 🔊 Class sound plays on the phone's CALL volume. Many students have it low
   /// (media volume high, call volume low) → "even Extra loud is not loud".
   /// min 0.6 = raise to at least 60 % when the class starts; 1.0 = full (Extra loud).
@@ -917,6 +929,8 @@ class Call {
     await _applyGain();
     // 🔊 call volume very low on this phone → raise it (Extra loud → full)
     unawaited(_Native.voiceVolume(ClassSound.level.value >= 2 ? 1.0 : 0.6));
+    // 🎤 clean our own mic before it is sent (room noise / far voices)
+    unawaited(_Native.voiceGate(true));
 
     if (_wantMic) {
       try {
