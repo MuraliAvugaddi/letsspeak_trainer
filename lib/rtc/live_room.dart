@@ -944,8 +944,10 @@ class Call {
         event.publication.source == lk.TrackSource.microphone) {
       _openGateFor(event.participant.identity);
     }
+    // (only when the mic is really ON — a muted / rejoining mic stays quiet)
     if (event is lk.TrackSubscribedEvent &&
-        event.track is lk.RemoteAudioTrack) {
+        event.track is lk.RemoteAudioTrack &&
+        !event.publication.muted) {
       _openGateFor(event.participant.identity);
     }
     // 🔊 every new voice gets the "loud" volume
@@ -1240,8 +1242,9 @@ class Call {
   // who is really speaking → only those voices play at full volume; the rest
   // are almost silent. Trainer / admin / Surendra Sir are always heard fully.
   // ---------------------------------------------------------------------
-  static const double _gateFloor =
-      0.08; // not speaking → ~ -22 dB (noise nearly gone)
+  // not speaking → ~ -30 dB: fan / pin drop / room noise of open mics is
+  // practically gone (was 0.08 = -22 dB → small sounds were still heard)
+  static const double _gateFloor = 0.03;
   static const Duration _gateHold = Duration(
     milliseconds: 1500,
   ); // keeps pauses between words
