@@ -457,10 +457,31 @@ class _PipCard extends StatelessWidget {
                         ),
                       ),
                     ),
-                    const Spacer(),
-                    Text(
-                      'Tap to open',
-                      style: GoogleFonts.poppins(color: const Color(0xFF8FB0C8), fontSize: 13),
+                    const SizedBox(width: 8),
+                    // 🎤 tap the small window once → Android shows the mute / unmute button
+                    Expanded(
+                      child: ValueListenableBuilder<String>(
+                        valueListenable: ClassPip.note,
+                        builder: (context, note, _) => ValueListenableBuilder<bool>(
+                          valueListenable: ClassPip.weakNet,
+                          builder: (context, weak, _) {
+                            final warn = note.isNotEmpty || weak;
+                            return Text(
+                              note.isNotEmpty
+                                  ? note
+                                  : (weak ? '📶 Your internet is weak' : 'Tap → 🎤 mute / unmute'),
+                              textAlign: TextAlign.right,
+                              maxLines: 2,
+                              overflow: TextOverflow.ellipsis,
+                              style: GoogleFonts.poppins(
+                                color: warn ? const Color(0xFFFFC857) : const Color(0xFF8FB0C8),
+                                fontSize: 12.5,
+                                fontWeight: warn ? FontWeight.w600 : FontWeight.w400,
+                              ),
+                            );
+                          },
+                        ),
+                      ),
                     ),
                   ],
                 ),

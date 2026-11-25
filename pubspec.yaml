@@ -2,7 +2,7 @@ name: letsspeak_trainer
 description: "A new Flutter project."
 publish_to: 'none'
 
-version: 1.0.0+2
+version: 1.0.0+3
 
 environment:
   sdk: ^3.10.1
@@ -297,7 +297,7 @@ flutter:
 flutter_icons:
   android: true
   ios: true
-  image_path: "assets/images/trainer_icon_1024.png"
+  image_path: "assets/images/trainer_icon_app.png"
   adaptive_icon_background: "#FFFFFF"
-  adaptive_icon_foreground: "assets/images/trainer_icon_1024.png"
+  adaptive_icon_foreground: "assets/images/trainer_icon_foreground.png"
   remove_alpha_ios: true

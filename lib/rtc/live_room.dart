@@ -128,6 +128,8 @@ class ClassPip {
     _wired = true;
     _Native._ch.setMethodCallHandler((c) async {
       if (c.method == 'pipChanged') inPip.value = c.arguments == true;
+      // 🎤 mute / unmute button on the small window (over WhatsApp / other apps)
+      if (c.method == 'pipToggleMic') await _toggleMicFromPip();
       return null;
     });
   }
@@ -136,6 +138,7 @@ class ClassPip {
   static Future<void> _allow(bool on) async {
     if (!_isAndroid || on == _allowed) return;
     _allowed = on;
+    _sentMic = null;
     _wire();
     try {
       await _Native._ch.invokeMethod('pip', {'on': on});
@@ -144,9 +147,55 @@ class ClassPip {
     }
   }
 
+  /// short message on the small window ("Mic locked", "Weak internet")
+  static final ValueNotifier<String> note = ValueNotifier<String>('');
+
+  /// 📶 my internet is weak right now (small window shows it)
+  static final ValueNotifier<bool> weakNet = ValueNotifier<bool>(false);
+  static Timer? _noteTimer;
+  static bool? _sentMic;
+
+  static void _flash(String text) {
+    note.value = text;
+    _noteTimer?.cancel();
+    _noteTimer = Timer(const Duration(seconds: 4), () => note.value = '');
+  }
+
+  /// 🎤 button on the small window → mic on / off (same rules as in class)
+  static Future<void> _toggleMicFromPip() async {
+    if (StreamVideo._active.isEmpty) return;
+    final c = StreamVideo._active.last;
+    final room = c._room;
+    if (room == null) return;
+    final on = room.localParticipant?.isMicrophoneEnabled() ?? false;
+    if (!on && c._inCall) {
+      _flash('You are on a phone call');
+      return;
+    }
+    if (!on && !c.canSpeakNow) {
+      _flash('Mic locked by your trainer');
+      return;
+    }
+    await c.setMicrophoneEnabled(enabled: !on);
+    _update(c, room);
+  }
+
+  /// tell Android which button to show (🎤 "Mute" or 🔇 "Unmute")
+  static void _sendMic(bool on) {
+    if (!_isAndroid || _sentMic == on) return;
+    _sentMic = on;
+    unawaited(
+      _Native._ch.invokeMethod('pipMic', {'on': on}).catchError((_) => null),
+    );
+  }
+
   static void _update(Call c, lk.Room? room) {
     if (!_isAndroid || !_allowed || room == null) return;
     micOn.value = room.localParticipant?.isMicrophoneEnabled() ?? false;
+    _sendMic(micOn.value);
+    final q = room.localParticipant?.connectionQuality;
+    weakNet.value =
+        q == lk.ConnectionQuality.poor || q == lk.ConnectionQuality.lost;
     onCall.value = c._inCall;
     String who = '';
     for (final p in room.activeSpeakers) {
@@ -194,6 +243,16 @@ class _Native {
     } catch (_) {
       return (inCall: false, mode: -1);
     }
+  }
+
+  /// 🔊 Class sound plays on the phone's CALL volume. Many students have it low
+  /// (media volume high, call volume low) → "even Extra loud is not loud".
+  /// min 0.6 = raise to at least 60 % when the class starts; 1.0 = full (Extra loud).
+  static Future<void> voiceVolume(double min) async {
+    if (!_isAndroid) return;
+    try {
+      await _ch.invokeMethod('voiceVolume', {'min': min});
+    } catch (_) {}
   }
 
   /// After a call Android may leave the sound in "normal" mode → class sound
@@ -363,6 +422,8 @@ class ClassSound {
 
   static Future<void> setLevel(int l) async {
     level.value = l.clamp(0, 2);
+    // 🔊 Extra loud → phone call volume to the top too
+    if (level.value == 2) unawaited(_Native.voiceVolume(1.0));
     await _call?._applyGain();
   }
 
@@ -662,9 +723,32 @@ class Call {
   bool _inCall = false;
   bool _micBeforeCall = false;
   bool _checkingCall = false;
+  bool _micStopped = false; // 📞 mic fully switched off for a phone call
 
   /// true while the person is on a phone / WhatsApp call (screens may show it)
   bool get inPhoneCall => _inCall;
+
+  /// 🎤 May I switch my mic on now? (the trainer can lock all mics;
+  /// trainers / admins always can)
+  bool get canSpeakNow {
+    final room = _room;
+    if (room == null) return false;
+    if (_isStaffMeta(room.localParticipant?.metadata)) return true;
+    Map<dynamic, dynamic> c = _custom;
+    final packed = c['state'];
+    if (packed is String && packed.isNotEmpty) {
+      try {
+        final d = jsonDecode(packed);
+        if (d is Map) c = d;
+      } catch (_) {}
+    }
+    if (c['micLocked'] != true) return true;
+    final a = c['allowed'];
+    final ids = a is List
+        ? a.map((e) => e.toString()).toSet()
+        : '${a ?? ''}'.split(',').toSet();
+    return ids.contains(userId);
+  }
 
   /// How long we keep trying before we give up ("connection was lost")
   static const Duration _giveUpAfter = Duration(minutes: 3);
@@ -774,6 +858,7 @@ class Call {
 
   /// Token from our server → connect to LiveKit → sound + mic like before
   Future<void> _connect() async {
+    _micStopped = false; // new room → new mic
     final data = await _post('/rtc/room-token', {'room': id});
     final url = (data['url'] ?? '').toString();
     final token = (data['token'] ?? '').toString();
@@ -792,6 +877,10 @@ class Call {
           highPassFilter: true,
           voiceIsolation: true,
           typingNoiseDetection: true,
+          // ⚡ MUTE keeps the mic ready (only switched off), so after UNMUTE the
+          //    very first word goes out at once. Before, the mic was restarted on
+          //    every unmute (~0.5 s) → "Hii mam" reached the trainer as "Hii…".
+          stopAudioCaptureOnMute: false,
         ),
         // 🎧 speech: silence is not sent (dtx) + protection against lost packets (red)
         //    🌐 web (Chrome): plain Opus — RED/DTX can make the voice silent in the browser
@@ -826,6 +915,8 @@ class Call {
     ); // 🔊 speaker / Bluetooth / headphones (headphones win when connected)
     await ClassSound._apply();
     await _applyGain();
+    // 🔊 call volume very low on this phone → raise it (Extra loud → full)
+    unawaited(_Native.voiceVolume(ClassSound.level.value >= 2 ? 1.0 : 0.6));
 
     if (_wantMic) {
       try {
@@ -845,6 +936,17 @@ class Call {
     if (event is lk.RoomDisconnectedEvent) {
       _onDisconnected(event.reason);
       return;
+    }
+    // ⚡ someone just switched the mic ON → their first words play at full volume
+    //    at once (before, the noise gate waited for "is speaking" → first word cut)
+    if (event is lk.TrackUnmutedEvent &&
+        event.participant is lk.RemoteParticipant &&
+        event.publication.source == lk.TrackSource.microphone) {
+      _openGateFor(event.participant.identity);
+    }
+    if (event is lk.TrackSubscribedEvent &&
+        event.track is lk.RemoteAudioTrack) {
+      _openGateFor(event.participant.identity);
     }
     // 🔊 every new voice gets the "loud" volume
     if (event is lk.TrackSubscribedEvent &&
@@ -910,16 +1012,17 @@ class Call {
     try {
       final me = room.localParticipant;
       final micOn = me?.isMicrophoneEnabled() ?? false;
-      final st = await _Native.callState(myMicOn: micOn);
+      // mic stays ready while muted (fast unmute) → it still counts as MY recording
+      final capturing =
+          !_micStopped &&
+          me?.getTrackPublicationBySource(lk.TrackSource.microphone) != null;
+      final st = await _Native.callState(myMicOn: capturing);
       if (st.inCall && !_inCall) {
         // 📞 call started → my mic off (class can't hear the call) + class sound off
         _inCall = true;
         _micBeforeCall = micOn;
-        if (micOn) {
-          try {
-            await me?.setMicrophoneEnabled(false);
-          } catch (_) {}
-        }
+        // mic OFF completely (also when muted, because the mic stays ready)
+        await _stopMicCapture(me);
         await _applyGain();
         _emitNow();
         debugPrint('📞 Call started → class paused on this phone');
@@ -931,7 +1034,7 @@ class Call {
         await _applyGain();
         if (_micBeforeCall && _wantMic) {
           try {
-            await room.localParticipant?.setMicrophoneEnabled(true);
+            await _micOn(room);
           } catch (_) {}
         }
         _micBeforeCall = false;
@@ -1186,6 +1289,50 @@ class Call {
     }
   }
 
+  /// Mic just switched on → voice open for 4 s (then normal "is speaking" rule)
+  void _openGateFor(String identity) {
+    if (kIsWeb) return;
+    _gateTimers.remove(identity)?.cancel();
+    final added = _gateOpen.add(identity);
+    _gateTimers[identity] = Timer(const Duration(seconds: 4), () {
+      _gateTimers.remove(identity);
+      final stillTalking =
+          _room?.activeSpeakers.any((p) => p.identity == identity) ?? false;
+      if (stillTalking) return; // the speaker rule closes it later
+      if (_gateOpen.remove(identity)) _regain(identity);
+    });
+    if (added) _regain(identity);
+  }
+
+  /// 📞 phone call: switch the mic OFF completely (not only muted),
+  /// so WhatsApp / the phone call gets the mic
+  Future<void> _stopMicCapture(lk.LocalParticipant? me) async {
+    final pub = me?.getTrackPublicationBySource(lk.TrackSource.microphone);
+    if (pub == null) return;
+    try {
+      if (pub.muted) {
+        await pub.track?.stop();
+      } else {
+        await pub.mute(stopOnMute: true);
+      }
+      _micStopped = true;
+    } catch (_) {}
+  }
+
+  /// Mic ON (fast). After a phone call the mic was switched off → start it again.
+  Future<void> _micOn(lk.Room room) async {
+    final me = room.localParticipant;
+    if (me == null) return;
+    final pub = me.getTrackPublicationBySource(lk.TrackSource.microphone);
+    if (pub != null && _micStopped) {
+      if (!pub.muted) await pub.mute(stopOnMute: false);
+      await pub.unmute(stopOnMute: true); // restarts the stopped mic
+      _micStopped = false;
+      return;
+    }
+    await me.setMicrophoneEnabled(true);
+  }
+
   void _clearGate() {
     for (final t in _gateTimers.values) {
       t.cancel();
@@ -1202,7 +1349,14 @@ class Call {
         _micBeforeCall = true;
         return Result.success<void>();
       }
-      await _room?.localParticipant?.setMicrophoneEnabled(enabled);
+      final room = _room;
+      if (room != null) {
+        if (enabled) {
+          await _micOn(room); // ⚡ fast: the mic is already ready
+        } else {
+          await room.localParticipant?.setMicrophoneEnabled(false);
+        }
+      }
       _wantMic = enabled;
       _emitNow();
       return Result.success<void>();

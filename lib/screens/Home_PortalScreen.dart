@@ -245,14 +245,15 @@ class ClassroomController {
   bool isOtherBatch(String userId) =>
       otherBatch.any((v) => v['userId']?.toString() == userId);
 
-  // 🔀 SECTION MERGE — other sections sitting in THIS class today
+  // 🔀 SECTION MERGE (English) / STAGE MERGE (Hindi) — others sitting in THIS class today
   // (their attendance + practice are still saved in their own section)
   final RxList<String> guestSections = <String>[].obs; // ["B", "C"]
   final RxMap<String, String> mergedFrom = <String, String>{}.obs; // studentId → "B"
   final RxList<Map<String, dynamic>> guestStudents = <Map<String, dynamic>>[].obs;
 
   Future<void> loadMerge() async {
-    if (language.toLowerCase() == 'hindi' || section.isEmpty) {
+    // Hindi has no sections, but the admin can merge Hindi STAGES (Stage 2 → Stage 1)
+    if (language.toLowerCase() != 'hindi' && section.isEmpty) {
       guestSections.clear();
       mergedFrom.clear();
       guestStudents.clear();
@@ -262,7 +263,7 @@ class ClassroomController {
       final res = await http
           .get(
             Uri.parse(
-              "${ApiEndpoints.trainerRoster}?stage=$stage&language=$language&section=$section&mode=online&_t=${DateTime.now().millisecondsSinceEpoch}",
+              "${ApiEndpoints.trainerRoster}?stage=$stage&language=$language&section=${language.toLowerCase() == 'hindi' ? 'all' : section}&mode=online&_t=${DateTime.now().millisecondsSinceEpoch}",
             ),
             headers: ApiHeaders.auth(),
           )
@@ -487,7 +488,7 @@ class ClassroomController {
         messages.add(ClassChatMsg(
           fromId: sig.from,
           fromName: sig.fromName,
-          text: text.length > 300 ? text.substring(0, 300) : text,
+          text: text.length > 1000 ? text.substring(0, 1000) : text,
           at: DateTime.now(),
           mine: false,
         ));
@@ -1600,6 +1601,39 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
     final mySection = (widget.teacherData['teacherSection'] ?? widget.teacherData['section'] ?? '')
         .toString()
         .toUpperCase();
+    // 🔀 Hindi stage merge: { language: Hindi, hostStage: stage1, guestStages: [stage2, ...] }
+    if ((data['language'] ?? '').toString().toLowerCase() == 'hindi') {
+      if (!_isHindiTrainer) return;
+      final hostStage = (data['hostStage'] ?? '').toString().toLowerCase();
+      final guestStages = (data['guestStages'] is List ? data['guestStages'] as List : const [])
+          .map((e) => e.toString().toLowerCase())
+          .toList();
+      if (hostStage != myStage && !guestStages.contains(myStage)) return;
+      fetchAssignedStudentsSilent();
+      if (ClassroomController.instance.call != null) ClassroomController.instance.loadMerge();
+      final merged = data['action'] == 'merged';
+      final iAmHost = hostStage == myStage;
+      final names = guestStages.map(_stageName).join(', ');
+      final text = iAmHost
+          ? (merged
+              ? '$names joined your Hindi class today. Their students are moving in now.'
+              : '$names went back to their own class.')
+          : (merged
+              ? 'Your stage is merged into ${_stageName(hostStage)} today. Your students are in ${_stageName(hostStage)}\'s class.'
+              : 'Unmerged — ${_stageName(myStage)} is your own class again. Start your class.');
+      Get.snackbar(
+        merged ? 'Stage merge' : 'Stage unmerged',
+        text,
+        backgroundColor: merged ? brandNavy : accentGreen,
+        colorText: Colors.white,
+        icon: const Icon(Icons.merge_type_rounded, color: Colors.white),
+        duration: const Duration(seconds: 5),
+        margin: const EdgeInsets.all(14),
+      );
+      return;
+    }
+    if (_isHindiTrainer) return; // English section merge is not for Hindi trainers
+
     final stage = (data['stage'] ?? '').toString().toLowerCase();
     final host = (data['hostSection'] ?? '').toString().toUpperCase();
     final guests = (data['guestSections'] is List ? data['guestSections'] as List : const [])
@@ -1630,6 +1664,22 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
     );
   }
 
+  bool get _isHindiTrainer => (widget.teacherData['language'] ?? '').toString().toLowerCase() == 'hindi';
+
+  /// "stage2" → "Stage 2"
+  String _stageName(String v) => 'Stage ${v.replaceAll(RegExp(r'[^0-9]'), '')}';
+
+  /// "B" → "Section B", "Stage 2" → "Stage 2" (Hindi stage merge)
+  String _secLabel(String v) => v.toLowerCase().startsWith('stage') ? v : 'Section $v';
+
+  /// my own class name: "Section B" (English) or "Stage 2" (Hindi)
+  String get _myClassLabel {
+    if (_isHindiTrainer) {
+      return _stageName((widget.teacherData['teacherStage'] ?? widget.teacherData['stage'] ?? 'stage1').toString());
+    }
+    return 'Section ${(widget.teacherData['teacherSection'] ?? widget.teacherData['section'] ?? '').toString().toUpperCase()}';
+  }
+
   /// Section B's trainer is back → ends the merge, students go back to B
   Future<void> _unmergeMine() async {
     final id = _mergeId;
@@ -1642,7 +1692,7 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
         title: Text("I'm back — unmerge?",
             style: GoogleFonts.poppins(color: textPrimary, fontWeight: FontWeight.w700, fontSize: 16)),
         content: Text(
-          'Your students leave Section $host\'s class and come back to yours. Start your live class right after.',
+          'Your students leave ${_secLabel(host ?? '')}\'s class and come back to yours. Start your live class right after.',
           style: GoogleFonts.poppins(color: textSecondary, fontSize: 12.5, height: 1.45),
         ),
         actions: [
@@ -1662,7 +1712,9 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
     setState(() => _unmerging = true);
     try {
       final res = await http.delete(
-        Uri.parse("${ApiEndpoints.baseUrl}/admin/section-merges/$id"),
+        Uri.parse(_isHindiTrainer
+            ? "${ApiEndpoints.baseUrl}/admin/hindi-stage-merges/$id"
+            : "${ApiEndpoints.baseUrl}/admin/section-merges/$id"),
         headers: ApiHeaders.auth(),
       );
       if (res.statusCode == 200) {
@@ -2308,7 +2360,6 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
   /// This trainer's section is merged into another section today
   Widget _buildMergedAwayCard() {
     final host = _mergedIntoHost ?? '';
-    final mySection = (widget.teacherData['teacherSection'] ?? widget.teacherData['section'] ?? '').toString().toUpperCase();
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.all(20),
@@ -2334,11 +2385,11 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text('Section $mySection is merged into Section $host',
+                    Text('$_myClassLabel is merged into ${_secLabel(host)}',
                         style: GoogleFonts.poppins(color: brandNavy, fontSize: 15, fontWeight: FontWeight.w700)),
                     const SizedBox(height: 2),
                     Text(
-                      'Your students are in Section $host\'s class today. Their attendance & practice are still saved in Section $mySection.',
+                      'Your students are in ${_secLabel(host)}\'s class today. Their attendance & practice are still saved in $_myClassLabel.',
                       style: GoogleFonts.poppins(color: const Color(0xff71859A), fontSize: 11.5, height: 1.4),
                     ),
                   ],
@@ -2388,8 +2439,8 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
           const SizedBox(width: 10),
           Expanded(
             child: Text(
-              'Section ${guests.join(', ')} ${guests.length > 1 ? 'are' : 'is'} merged into your class today • $count student${count == 1 ? '' : 's'}. '
-              'Do their practice & rating as usual — it is saved in their own section.',
+              '${guests.map(_secLabel).join(', ')} ${guests.length > 1 ? 'are' : 'is'} merged into your class today • $count student${count == 1 ? '' : 's'}. '
+              'Do their practice & rating as usual — it is saved in their own class.',
               style: GoogleFonts.poppins(color: const Color(0xff4A3AA8), fontSize: 11.5, fontWeight: FontWeight.w600, height: 1.4),
             ),
           ),
@@ -3137,7 +3188,7 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
                                   ),
                                 if ((student['mergedFrom'] ?? '').toString().isNotEmpty)
                                   Text(
-                                    'From Section ${student['mergedFrom']}',
+                                    'From ${_secLabel(student['mergedFrom'].toString())}',
                                     style: GoogleFonts.poppins(
                                       color: const Color(0xff7A5AF8),
                                       fontSize: 9.5,
@@ -3222,7 +3273,12 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
                       runSpacing: 5,
                       children: [
                         if ((student['mergedFrom'] ?? '').toString().isNotEmpty)
-                          _statusBadge('From Sec ${student['mergedFrom']}', const Color(0xff7A5AF8)),
+                          _statusBadge(
+                            student['mergedFrom'].toString().toLowerCase().startsWith('stage')
+                                ? 'From ${student['mergedFrom']}'
+                                : 'From Sec ${student['mergedFrom']}',
+                            const Color(0xff7A5AF8),
+                          ),
                         // 🔁 admin changed this student only for some days
                         if (tempModeText(student) != null)
                           _statusBadge(tempModeText(student)!, const Color(0xffE59E1B)),
@@ -4415,7 +4471,7 @@ class _TeacherBroadcastScreenState extends State<TeacherBroadcastScreen> {
           const SizedBox(width: 8),
           Expanded(
             child: Text(
-              'Section ${guests.join(', ')} merged in • $n student${n == 1 ? '' : 's'} (badge on their photo). Practice is saved in their own section.',
+              '${guests.map((g) => g.toLowerCase().startsWith('stage') ? g : 'Section $g').join(', ')} merged in • $n student${n == 1 ? '' : 's'} (badge on their photo). Practice is saved in their own class.',
               style: GoogleFonts.poppins(color: const Color(0xff4A3AA8), fontSize: 10.5, fontWeight: FontWeight.w600),
             ),
           ),
@@ -5580,7 +5636,10 @@ class _TeacherBroadcastScreenState extends State<TeacherBroadcastScreen> {
                         border: Border.all(color: Colors.white, width: 1.2),
                       ),
                       child: Text(
-                        cc.mergedFrom[p.userId]!,
+                        // "Stage 2" → "S2" (small badge)
+                        cc.mergedFrom[p.userId]!.toLowerCase().startsWith('stage')
+                            ? 'S${cc.mergedFrom[p.userId]!.replaceAll(RegExp(r'[^0-9]'), '')}'
+                            : cc.mergedFrom[p.userId]!,
                         style: GoogleFonts.poppins(color: Colors.white, fontSize: 8.5, fontWeight: FontWeight.w800),
                       ),
                     ),

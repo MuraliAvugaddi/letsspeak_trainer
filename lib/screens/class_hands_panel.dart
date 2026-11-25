@@ -9,6 +9,7 @@
 // Everything comes from ClassroomController (Home_PortalScreen.dart).
 // =========================================================================
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:get/get.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:letsspeak_trainer/screens/Home_PortalScreen.dart';
@@ -521,11 +522,15 @@ class _ChatSheetState extends State<_ChatSheet> {
                     Expanded(
                       child: TextField(
                         controller: _text,
-                        maxLength: 300,
+                        // ✍️ long messages + emojis + new lines (questions for the class).
+                        //    Before: 300 letters max → long pasted text was cut / not sent.
+                        maxLength: 2000,
+                        maxLengthEnforcement: MaxLengthEnforcement.enforced,
                         minLines: 1,
-                        maxLines: 3,
-                        textInputAction: TextInputAction.send,
-                        onSubmitted: (_) => _send(),
+                        maxLines: 6,
+                        keyboardType: TextInputType.multiline,
+                        textInputAction: TextInputAction.newline,
+                        textCapitalization: TextCapitalization.sentences,
                         // ✍️ typed letters: dark & clear on the light box (theme made them white / pale)
                         style: GoogleFonts.poppins(
                           fontSize: 14,
@@ -598,6 +603,14 @@ class _ChatSheetState extends State<_ChatSheet> {
       alignment: m.mine ? Alignment.centerRight : Alignment.centerLeft,
       child: GestureDetector(
         onTap: m.mine ? null : () => setState(() => _replyTo = m),
+        // 📋 long-press → copy the message
+        onLongPress: () async {
+          await Clipboard.setData(ClipboardData(text: m.text));
+          if (!mounted) return;
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Message copied'), duration: Duration(seconds: 2)),
+          );
+        },
         child: Container(
           margin: const EdgeInsets.only(bottom: 8),
           constraints: BoxConstraints(
@@ -621,7 +634,7 @@ class _ChatSheetState extends State<_ChatSheet> {
               ),
               const SizedBox(height: 2),
               Text(
-                m.text,
+                m.text, // tap = reply, long-press = copy
                 style: GoogleFonts.poppins(
                   fontSize: 13,
                   color: m.mine ? Colors.white : _deepNavy,

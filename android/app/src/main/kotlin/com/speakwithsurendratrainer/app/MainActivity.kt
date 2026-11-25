@@ -1,6 +1,13 @@
 package com.speakwithsurendratrainer.app
 
+import android.app.PendingIntent
 import android.app.PictureInPictureParams
+import android.app.RemoteAction
+import android.content.BroadcastReceiver
+import android.content.Intent
+import android.content.IntentFilter
+import android.graphics.drawable.Icon
+import android.os.Bundle
 import android.content.Context
 import android.content.pm.PackageManager
 import android.content.res.Configuration
@@ -19,6 +26,10 @@ class MainActivity : FlutterActivity() {
     // 📺 class as a small window over WhatsApp / other apps (only while in class)
     //    (kept in the companion object → still known if Android re-opens this screen)
     private var classChannel: MethodChannel? = null
+
+    // 🎤 mute / unmute button on the small window
+    private var micReceiver: BroadcastReceiver? = null
+    private val micAction: String get() = "$packageName.PIP_TOGGLE_MIC"
 
     // ---------------------------------------------------------------
     // 🛟 The app (and the live class inside it) lives in ONE Flutter engine that
@@ -41,6 +52,37 @@ class MainActivity : FlutterActivity() {
     companion object {
         private const val ENGINE_ID = "letsspeak_main"
         private var pipWanted = false
+        private var pipMicOn = false // 🎤 mic on → small window shows "Mute", else "Unmute"
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        // 🎤 the small window's mute / unmute button sends this → Flutter switches the mic
+        val r = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                try {
+                    classChannel?.invokeMethod("pipToggleMic", null)
+                } catch (_: Exception) {}
+            }
+        }
+        micReceiver = r
+        try {
+            val filter = IntentFilter(micAction)
+            if (Build.VERSION.SDK_INT >= 33) {
+                registerReceiver(r, filter, Context.RECEIVER_NOT_EXPORTED)
+            } else {
+                @Suppress("UnspecifiedRegisterReceiverFlag")
+                registerReceiver(r, filter)
+            }
+        } catch (_: Exception) {}
+    }
+
+    override fun onDestroy() {
+        try {
+            micReceiver?.let { unregisterReceiver(it) }
+        } catch (_: Exception) {}
+        micReceiver = null
+        super.onDestroy()
     }
 
     override fun onResume() {
@@ -76,6 +118,23 @@ class MainActivity : FlutterActivity() {
                     "pip" -> {
                         pipWanted = call.argument<Boolean>("on") == true
                         updatePip()
+                        result.success(true)
+                    }
+                    "pipMic" -> {
+                        pipMicOn = call.argument<Boolean>("on") == true
+                        updatePip() // 🎤 / 🔇 button on the small window
+                        result.success(true)
+                    }
+                    "voiceVolume" -> {
+                        // 🔊 class sound uses the CALL volume → raise it if it is too low
+                        try {
+                            val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                            val max = am.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL)
+                            val min = ((call.argument<Double>("min") ?: 0.6) * max).toInt().coerceIn(1, max)
+                            if (am.getStreamVolume(AudioManager.STREAM_VOICE_CALL) < min) {
+                                am.setStreamVolume(AudioManager.STREAM_VOICE_CALL, min, 0)
+                            }
+                        } catch (_: Exception) {}
                         result.success(true)
                     }
                     "outputs" -> result.success(soundDevices())
@@ -127,11 +186,27 @@ class MainActivity : FlutterActivity() {
     private fun pipParams(): PictureInPictureParams? {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return null
         val b = PictureInPictureParams.Builder().setAspectRatio(Rational(3, 2))
+        micButton()?.let { b.setActions(listOf(it)) }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             b.setAutoEnterEnabled(pipWanted)
             b.setSeamlessResizeEnabled(false)
         }
         return b.build()
+    }
+
+    /** 🎤 "Mute" / 🔇 "Unmute" button shown when the person taps the small window */
+    private fun micButton(): RemoteAction? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O || !pipWanted) return null
+        return try {
+            var flags = PendingIntent.FLAG_UPDATE_CURRENT
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) flags = flags or PendingIntent.FLAG_IMMUTABLE
+            val pi = PendingIntent.getBroadcast(this, 7701, Intent(micAction).setPackage(packageName), flags)
+            val icon = Icon.createWithResource(this, if (pipMicOn) R.drawable.ic_pip_mic else R.drawable.ic_pip_mic_off)
+            val title = if (pipMicOn) "Mute" else "Unmute"
+            RemoteAction(icon, title, title, pi)
+        } catch (_: Exception) {
+            null
+        }
     }
 
     private fun updatePip() {
