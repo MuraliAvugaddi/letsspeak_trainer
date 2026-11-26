@@ -855,17 +855,29 @@ class Call {
     _status = CallStatus.connecting;
     _emitNow();
     _wantMic = connectOptions?.microphone.isOn ?? false;
-    try {
-      await _connect();
-      _whenConnected();
-      return Result.success<void>();
-    } catch (e) {
-      debugPrint('LiveKit join error: $e');
-      await _closeRoom();
-      _status = CallStatus.disconnected;
-      _emitNow();
-      return Result.failure<void>(e);
+    // 📶 slow / unstable internet: try up to 3 times (2 s, then 4 s apart) before
+    // giving up. Only network problems and server hiccups (5xx) are retried —
+    // "class not started", "not your class" etc. come back at once.
+    Object? lastError;
+    for (var attempt = 0; attempt < 3; attempt++) {
+      try {
+        await _connect();
+        _whenConnected();
+        return Result.success<void>();
+      } catch (e) {
+        lastError = e;
+        debugPrint('LiveKit join error (try ${attempt + 1}/3): $e');
+        await _closeRoom();
+        if (_left) break;
+        final retry = e is! _ServerError || e.code >= 500;
+        if (!retry || attempt == 2) break;
+        await Future.delayed(Duration(seconds: 2 + attempt * 2));
+        if (_left) break;
+      }
     }
+    _status = CallStatus.disconnected;
+    _emitNow();
+    return Result.failure<void>(lastError ?? Exception('Could not join the class'));
   }
 
   /// Token from our server → connect to LiveKit → sound + mic like before

@@ -1992,9 +1992,16 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
         ),
       );
     } catch (e) {
+      var msg = e.toString().replaceFirst('Exception: ', '');
+      if (RegExp(r'SocketException|Failed host lookup|ClientException|TimeoutException|Connection (reset|closed|refused)',
+              caseSensitive: false)
+          .hasMatch(msg)) {
+        msg = "Your internet is too weak right now. Please move to a better signal "
+            "(or switch Wi-Fi / mobile data) and tap Start again.";
+      }
       Get.snackbar(
-        "Broadcast Error",
-        e.toString().replaceFirst('Exception: ', ''),
+        "Could not start the class",
+        msg,
         backgroundColor: accentRed,
         colorText: Colors.white,
         duration: const Duration(seconds: 12),
@@ -2013,20 +2020,43 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
   ) async {
     final teacherId =
         (widget.teacherData['_id'] ?? widget.teacherData['id'] ?? '').toString();
-    final res = await http
-        .post(
-          Uri.parse(ApiEndpoints.prepareCall),
-          headers: ApiHeaders.json(),
-          body: jsonEncode({
-            "userId": teacherId,
-            "language": language,
-            "stage": stage,
-            "section": section,
-            "type": "class",
-          }),
-        )
-        .timeout(const Duration(seconds: 25));
-    final data = jsonDecode(res.body);
+    // 📶 weak internet: one lost request is not a failure → try 3 times
+    http.Response? res;
+    for (var attempt = 0; attempt < 3; attempt++) {
+      try {
+        res = await http
+            .post(
+              Uri.parse(ApiEndpoints.prepareCall),
+              headers: ApiHeaders.json(),
+              body: jsonEncode({
+                "userId": teacherId,
+                "language": language,
+                "stage": stage,
+                "section": section,
+                "type": "class",
+              }),
+            )
+            .timeout(const Duration(seconds: 25));
+        if (res.statusCode < 500) break; // answer from the server → use it
+      } catch (e) {
+        debugPrint("prepare-call try ${attempt + 1}/3: $e");
+        if (attempt == 2) {
+          throw Exception(
+            "Your internet is too weak right now. Please move to a better signal "
+            "(or switch Wi-Fi / mobile data) and tap Start again.",
+          );
+        }
+      }
+      await Future.delayed(Duration(seconds: 2 + attempt * 2));
+    }
+    if (res == null) {
+      throw Exception("Could not reach the server. Please tap Start again.");
+    }
+    Map data = {};
+    try {
+      final d = jsonDecode(res.body);
+      if (d is Map) data = d;
+    } catch (_) {}
     if (res.statusCode == 200 && (data['callId'] ?? '').toString().isNotEmpty) {
       return data['callId'].toString();
     }
