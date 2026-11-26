@@ -5,13 +5,13 @@ class ApiEndpoints {
 
   // 🖥️ LOCAL (Mac running `node index.js` on port 5001, phone on same Wi-Fi)
   // Note: Uses 'http' instead of 'https' because local Node servers do not use SSL by default.
-  static const String baseUrl = "http://192.168.1.14:5001/api";
+ // static const String baseUrl = "http://192.168.1.14:5001/api";
 
   // 🚀 PRODUCTION (Render): uncomment this and comment the LOCAL line above
   // static const String baseUrl = "https://lets-talk-backend-o06t.onrender.com/api";
 
   // 🌐 ALTERNATIVE DOMAIN:
-  // static const String baseUrl = "https://api.letsspeakglobal.com/api";
+   static const String baseUrl = "https://api.letsspeakglobal.com/api";
 
   // =====================================================
   // Auth Endpoints
