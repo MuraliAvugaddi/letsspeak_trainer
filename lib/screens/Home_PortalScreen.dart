@@ -1574,7 +1574,15 @@ class _TeacherPortalScreenState extends State<TeacherPortalScreen>
       // 🔀 admin merged / unmerged sections → roster + live class update instantly
       _ioSocket?.on('merge_updated', _onMergeUpdated);
       // admin switched online-day / special class → update instantly (state comes with the event)
+      // 🎙 special class: Sir went live / ended it → the special class screen reacts at once
+      _ioSocket?.on('assembly_live', (_) => AssemblyJoinScreen.events.add('live'));
+      _ioSocket?.on('assembly_ended', (_) => AssemblyJoinScreen.events.add('ended'));
       _ioSocket?.on('class_mode_update', (data) {
+        // special class switched OFF by the admin → close it on this phone too
+        if (data is Map && data.containsKey('assembly')) {
+          final a = data['assembly'];
+          if (a == null || (a is Map && a['active'] != true)) AssemblyJoinScreen.events.add('ended');
+        }
         if (data is Map && data.containsKey('rain') && mounted) {
           setState(() {
             _rainMode = data['rain'] is Map ? Map<String, dynamic>.from(data['rain']) : null;

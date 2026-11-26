@@ -16,6 +16,11 @@ import 'package:letsspeak_trainer/screens/Home_PortalScreen.dart' show StreamMan
 /// Trainers join muted. Mic button works when Sir lets everyone talk (or allowed this trainer).
 /// Attendance is marked for the trainer's stage.
 class AssemblyJoinScreen extends StatefulWidget {
+  /// ⚡ live signals from the server socket (Home_PortalScreen forwards them):
+  ///   'ended' → Sir ended the special class / admin removed it → close at once
+  ///   'live'  → Sir went live → join now (while waiting)
+  static final StreamController<String> events = StreamController<String>.broadcast();
+
   final Map<String, dynamic> teacherData;
   final String title;
   final String startTime;
@@ -44,6 +49,7 @@ class _AssemblyJoinScreenState extends State<AssemblyJoinScreen> {
   Timer? _tick;
   bool _leaving = false;
   bool _micBusy = false;
+  StreamSubscription<String>? _events;
 
   String get _userId => (widget.teacherData['_id'] ?? widget.teacherData['id'] ?? '').toString();
   String get _userName => (widget.teacherData['name'] ?? 'Trainer').toString();
@@ -54,7 +60,28 @@ class _AssemblyJoinScreenState extends State<AssemblyJoinScreen> {
   void initState() {
     super.initState();
     WakelockPlus.enable();
+    _events = AssemblyJoinScreen.events.stream.listen(_onServerEvent);
     _connect();
+  }
+
+  void _onServerEvent(String e) {
+    if (!mounted || _leaving) return;
+    if (e == 'ended') {
+      // ⛔ Sir ended it → leave now. (Before, the trainer phone could quietly
+      //    join an EMPTY new room again and stay "live" after the class ended.)
+      final wasLive = phase == _Phase.live || phase == _Phase.joining;
+      _leave();
+      Get.snackbar(
+        'Class finished',
+        wasLive ? 'The special class has ended. Thank you!' : 'The special class was ended by Sir.',
+        backgroundColor: const Color(0xFF0E466D),
+        colorText: Colors.white,
+        snackPosition: SnackPosition.TOP,
+      );
+    } else if (e == 'live' && phase == _Phase.waiting) {
+      _retry?.cancel();
+      _retry = Timer(Duration(milliseconds: 300 + _rnd.nextInt(5000)), _connect);
+    }
   }
 
   @override
@@ -62,6 +89,7 @@ class _AssemblyJoinScreenState extends State<AssemblyJoinScreen> {
     _retry?.cancel();
     _sync?.cancel();
     _tick?.cancel();
+    _events?.cancel();
     WakelockPlus.disable();
     if (!_leaving) _leave(pop: false);
     super.dispose();
