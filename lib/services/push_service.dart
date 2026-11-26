@@ -8,6 +8,7 @@ import 'package:get_storage/get_storage.dart';
 import 'package:http/http.dart' as http;
 import 'package:letsspeak_trainer/Api/Apiend_points.dart';
 import 'package:letsspeak_trainer/services/trainer_alerts.dart';
+import 'package:letsspeak_trainer/services/trainer_requests.dart';
 
 /// 🔔 Phone notifications for trainers ("👋 New student: Venkat").
 ///
@@ -27,18 +28,39 @@ class PushService {
     try {
       if (Firebase.apps.isEmpty) await Firebase.initializeApp();
       final fm = FirebaseMessaging.instance;
-      await fm.setForegroundNotificationPresentationOptions(alert: true, badge: true, sound: true);
+      await fm.setForegroundNotificationPresentationOptions(
+        alert: true,
+        badge: true,
+        sound: true,
+      );
       // app open → the live pop-up (socket) already shows it; just refresh the list
-      FirebaseMessaging.onMessage.listen((_) => TrainerAlerts.load());
-      // tapped the notification → open the "New students" tab
-      FirebaseMessaging.onMessageOpenedApp.listen((_) => _openAlerts());
+      FirebaseMessaging.onMessage.listen((m) {
+        if (m.data['type'] == 'class_request') {
+          TrainerRequests.load(); // 🙋 student request / reply
+        } else {
+          TrainerAlerts.load();
+        }
+      });
+      // tapped the notification → open the inbox (request chat or "New students")
+      FirebaseMessaging.onMessageOpenedApp.listen(_openFrom);
       final first = await fm.getInitialMessage();
-      if (first != null) _openAlerts();
+      if (first != null) _openFrom(first);
       fm.onTokenRefresh.listen((t) => _send(t));
       _ready = true;
     } catch (e) {
       debugPrint('🔕 Trainer push is off (google-services.json missing?): $e');
     }
+  }
+
+  static void _openFrom(RemoteMessage m) {
+    if (m.data['type'] == 'class_request') {
+      TrainerRequests.load();
+      TrainerRequests.openId.value = '${m.data['id'] ?? ''}';
+      TrainerAlerts.openTab.value =
+          TrainerAlerts.openTab.value + 1; // → inbox tab
+      return;
+    }
+    _openAlerts();
   }
 
   static void _openAlerts() {
@@ -53,7 +75,11 @@ class PushService {
       final login = (GetStorage().read('token') ?? '').toString();
       if (login.isEmpty) return;
       final fm = FirebaseMessaging.instance;
-      final perm = await fm.requestPermission(alert: true, badge: true, sound: true);
+      final perm = await fm.requestPermission(
+        alert: true,
+        badge: true,
+        sound: true,
+      );
       if (perm.authorizationStatus == AuthorizationStatus.denied) return;
       if (Platform.isIOS) {
         for (var i = 0; i < 5 && await fm.getAPNSToken() == null; i++) {
@@ -73,7 +99,10 @@ class PushService {
     final res = await http
         .post(
           Uri.parse('${ApiEndpoints.baseUrl}/user/push-token'),
-          headers: {'Content-Type': 'application/json', 'Authorization': 'Bearer $login'},
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer $login',
+          },
           body: jsonEncode({'token': fcmToken}),
         )
         .timeout(const Duration(seconds: 15));
@@ -91,7 +120,10 @@ class PushService {
         await http
             .delete(
               Uri.parse('${ApiEndpoints.baseUrl}/user/push-token'),
-              headers: {'Content-Type': 'application/json', 'Authorization': 'Bearer $login'},
+              headers: {
+                'Content-Type': 'application/json',
+                'Authorization': 'Bearer $login',
+              },
               body: jsonEncode({'token': t}),
             )
             .timeout(const Duration(seconds: 8));

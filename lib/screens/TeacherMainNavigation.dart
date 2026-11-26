@@ -1,7 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:letsspeak_trainer/screens/Home_PortalScreen.dart';
-import 'package:letsspeak_trainer/screens/TeacherAlertsScreen.dart';
+import 'package:letsspeak_trainer/screens/TrainerInboxScreen.dart';
+import 'package:letsspeak_trainer/services/trainer_requests.dart';
 import 'package:letsspeak_trainer/services/push_service.dart';
 import 'package:letsspeak_trainer/services/trainer_alerts.dart';
 import 'package:letsspeak_trainer/screens/TeacherMaterialsScreen.dart';
@@ -42,14 +43,17 @@ class _TeacherMainNavigationState extends State<TeacherMainNavigation> {
 
     _screens = [
       TeacherPortalScreen(teacherData: widget.teacherData),
-      const TeacherAlertsScreen(), // 👋 new students added to my class
+      const TrainerInboxScreen(), // 🙋 student requests + 👋 new students
       TeacherMaterialsScreen(teacherData: widget.teacherData),
-      TeacherTestsScreen(teacherData: widget.teacherData), // ✍️ write tests for admin approval
+      TeacherTestsScreen(
+        teacherData: widget.teacherData,
+      ), // ✍️ write tests for admin approval
       TeacherProfileScreen(teacherData: widget.teacherData),
     ];
 
     // 👋 "New student in your class": live pop-up + list + phone notification
-    final id = (widget.teacherData['_id'] ?? widget.teacherData['id'] ?? '').toString();
+    final id = (widget.teacherData['_id'] ?? widget.teacherData['id'] ?? '')
+        .toString();
     TrainerAlerts.start(id);
     PushService.register();
     TrainerAlerts.openTab.addListener(_openAlerts);
@@ -69,7 +73,8 @@ class _TeacherMainNavigationState extends State<TeacherMainNavigation> {
   void _select(int index) {
     setState(() => _currentIndex = index);
     // looked at the list → not "new" any more
-    if (index == 1) Future.delayed(const Duration(seconds: 2), TrainerAlerts.markAllRead);
+    if (index == 1)
+      Future.delayed(const Duration(seconds: 2), TrainerAlerts.markAllRead);
   }
 
   @override
@@ -129,7 +134,7 @@ class _TeacherMainNavigationState extends State<TeacherMainNavigation> {
                 child: _buildNavItem(
                   index: 1,
                   icon: Icons.notifications_rounded,
-                  label: 'New',
+                  label: 'Inbox',
                 ),
               ),
               Expanded(
@@ -163,14 +168,18 @@ class _TeacherMainNavigationState extends State<TeacherMainNavigation> {
   // 🔴 number of new students on the "New" tab
   Widget _withBadge(int index, Widget icon) {
     if (index != 1) return icon;
-    return ValueListenableBuilder<int>(
-      valueListenable: TrainerAlerts.unread,
-      builder: (_, n, child) => Badge(
-        isLabelVisible: n > 0,
-        label: Text(n > 99 ? '99+' : '$n'),
-        backgroundColor: const Color(0xFFE85D5D),
-        child: child,
-      ),
+    // 🔴 new students + student requests waiting for me
+    return AnimatedBuilder(
+      animation: Listenable.merge([TrainerAlerts.unread, TrainerRequests.open]),
+      builder: (_, child) {
+        final n = TrainerAlerts.unread.value + TrainerRequests.open.value;
+        return Badge(
+          isLabelVisible: n > 0,
+          label: Text(n > 99 ? '99+' : '$n'),
+          backgroundColor: const Color(0xFFE85D5D),
+          child: child,
+        );
+      },
       child: icon,
     );
   }
@@ -221,7 +230,9 @@ class _TeacherMainNavigationState extends State<TeacherMainNavigation> {
                 Icon(
                   icon,
                   size: selected ? 23 : 22,
-                  color: selected ? brandNavy : brandNavy.withValues(alpha: 0.48),
+                  color: selected
+                      ? brandNavy
+                      : brandNavy.withValues(alpha: 0.48),
                 ),
               ),
             ),
@@ -281,7 +292,7 @@ class _TeacherMainNavigationState extends State<TeacherMainNavigation> {
                 _buildWebNavItem(
                   index: 1,
                   icon: Icons.notifications_rounded,
-                  label: 'New students',
+                  label: 'Inbox',
                 ),
                 const SizedBox(width: 12),
                 _buildWebNavItem(

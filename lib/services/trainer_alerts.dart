@@ -6,6 +6,7 @@ import 'package:http/http.dart' as http;
 import 'package:letsspeak_trainer/Api/Apiend_points.dart';
 import 'package:letsspeak_trainer/Api/api_headers.dart';
 import 'package:socket_io_client/socket_io_client.dart' as IO;
+import 'package:letsspeak_trainer/services/trainer_requests.dart';
 
 /// 👋 "New student in your class" for the trainer
 ///
@@ -52,8 +53,11 @@ class TrainerAlerts {
       s.onConnect((_) {
         s.emit('join_user_room', teacherId);
         load(); // anything that came while the app was closed
+        TrainerRequests.load();
       });
       s.on('new_student', _onNew);
+      // 🙋 a student request changed (new / reply / manager solved) → reload the list
+      s.on('request_update', (_) => TrainerRequests.load());
       _socket = s;
     } catch (e) {
       debugPrint('Trainer alerts socket error: $e');
@@ -75,7 +79,9 @@ class TrainerAlerts {
     if (data is! Map) return;
     final a = Map<String, dynamic>.from(data);
     final id = (a['_id'] ?? '').toString();
-    if (id.isNotEmpty && items.value.any((x) => (x['_id'] ?? '').toString() == id)) return;
+    if (id.isNotEmpty &&
+        items.value.any((x) => (x['_id'] ?? '').toString() == id))
+      return;
     items.value = [a, ...items.value];
     unread.value = unread.value + 1;
 
@@ -89,7 +95,10 @@ class TrainerAlerts {
       borderWidth: 1.4,
       margin: const EdgeInsets.all(12),
       duration: const Duration(seconds: 6),
-      icon: const Icon(Icons.person_add_alt_1_rounded, color: Color(0xFF155A8A)),
+      icon: const Icon(
+        Icons.person_add_alt_1_rounded,
+        color: Color(0xFF155A8A),
+      ),
       onTap: (_) => openTab.value = openTab.value + 1,
     );
   }
@@ -97,7 +106,9 @@ class TrainerAlerts {
   static Future<void> load() async {
     loading.value = true;
     try {
-      final res = await http.get(Uri.parse(_url), headers: ApiHeaders.auth()).timeout(const Duration(seconds: 15));
+      final res = await http
+          .get(Uri.parse(_url), headers: ApiHeaders.auth())
+          .timeout(const Duration(seconds: 15));
       if (res.statusCode == 200) {
         final d = jsonDecode(res.body);
         if (d is Map) {
@@ -122,7 +133,11 @@ class TrainerAlerts {
     items.value = items.value.map((a) => {...a, 'read': true}).toList();
     try {
       await http
-          .post(Uri.parse('$_url/read'), headers: ApiHeaders.json(), body: jsonEncode({}))
+          .post(
+            Uri.parse('$_url/read'),
+            headers: ApiHeaders.json(),
+            body: jsonEncode({}),
+          )
           .timeout(const Duration(seconds: 15));
     } catch (_) {}
   }
