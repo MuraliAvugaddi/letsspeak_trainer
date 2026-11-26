@@ -295,7 +295,25 @@ class _TeacherAttendanceScreenState extends State<TeacherAttendanceScreen>
         }),
       );
 
-      if (res.statusCode == 200) {
+      // 👔 managers have no attendance → the server saves nothing
+      final bool noAttendance = res.statusCode == 200 &&
+          (() {
+            try {
+              return jsonDecode(res.body)['noAttendance'] == true;
+            } catch (_) {
+              return false;
+            }
+          })();
+      if (noAttendance) {
+        Get.snackbar(
+          "No attendance needed",
+          "Managers don't mark attendance. Only trainers and students do.",
+          backgroundColor: navy,
+          colorText: Colors.white,
+          margin: const EdgeInsets.all(14),
+          borderRadius: 14,
+        );
+      } else if (res.statusCode == 200) {
         Get.snackbar(
           "Attendance Marked",
           "Your attendance was marked successfully.",
