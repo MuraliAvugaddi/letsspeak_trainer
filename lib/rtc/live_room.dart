@@ -976,6 +976,15 @@ class Call {
         !event.publication.muted) {
       _openGateFor(event.participant.identity);
     }
+    // 🎤 a mic went on / off, or someone left → maybe switch the gate on / off
+    if (event is lk.TrackMutedEvent ||
+        event is lk.TrackUnmutedEvent ||
+        event is lk.TrackPublishedEvent ||
+        event is lk.TrackUnpublishedEvent ||
+        event is lk.TrackSubscribedEvent ||
+        event is lk.ParticipantDisconnectedEvent) {
+      _recountMics();
+    }
     // 🔊 every new voice gets the "loud" volume
     if (event is lk.TrackSubscribedEvent &&
         event.track is lk.RemoteAudioTrack) {
@@ -1283,7 +1292,39 @@ class Call {
     if (_inCall)
       return 0.0; // 📞 in a phone call → class sound off on this phone
     if (_alwaysHeard(p)) return ClassSound.gain;
+    // 🎤 only 1–3 students have the mic ON (practice turn) → no gate at all
+    if (_fewMics) return ClassSound.studentGain;
     return _gateOpen.contains(p.identity) ? ClassSound.studentGain : _gateFloor;
+  }
+
+  // ---------------------------------------------------------------------
+  // 🎤 The gate is only needed when MANY mics are open (their room noise adds
+  // up to "shhhh"). In practice time 1–3 students speak → play them fully.
+  // Before: after 4 s a student was heard only if LiveKit marked them as
+  // "speaking". A quiet phone mic (some new Android phones, earbuds, phone far
+  // from the mouth) never reached that level → heard 5 s, then silent.
+  // ---------------------------------------------------------------------
+  static const int _gateFromMics = 4;
+  bool _fewMics = true;
+
+  /// Count open student mics; when the answer changes → set all volumes again
+  void _recountMics() {
+    final room = _room;
+    var open = 0;
+    if (room != null) {
+      for (final p in room.remoteParticipants.values) {
+        if (_alwaysHeard(p)) continue;
+        final pub = p.getTrackPublicationBySource(lk.TrackSource.microphone);
+        if (pub != null && !pub.muted) {
+          open++;
+          if (open >= _gateFromMics) break;
+        }
+      }
+    }
+    final few = open < _gateFromMics;
+    if (few == _fewMics) return;
+    _fewMics = few;
+    unawaited(_applyGain());
   }
 
   void _onSpeakers(List<lk.Participant> speakers) {
@@ -1363,6 +1404,7 @@ class Call {
   }
 
   void _clearGate() {
+    _fewMics = true;
     for (final t in _gateTimers.values) {
       t.cancel();
     }
